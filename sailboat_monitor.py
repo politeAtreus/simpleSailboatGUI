@@ -120,30 +120,84 @@ def fmt_value(key: str, v) -> str:
     return s
 
 
+def is_stlink(port) -> bool:
+    """True if a pyserial ListPortInfo looks like an ST-Link Virtual COM Port.
+
+    Matches on the description text (covers the various wordings Windows uses:
+    'STMicroelectronics STLink Virtual COM Port', 'ST-Link', etc.) and, as a
+    fallback, on the STMicroelectronics USB vendor ID 0x0483.
+    """
+    desc = (port.description or "").lower()
+    if "stlink" in desc or "st-link" in desc or "st link" in desc:
+        return True
+    if getattr(port, "vid", None) == 0x0483:
+        return True
+    return False
+
+
 # --------------------------------------------------------------------------- #
 # Centered bar widget (for sail / rudder, which swing -45 .. +45 about zero)
 # --------------------------------------------------------------------------- #
 
+def _resolve_color(color):
+    """Pick the light or dark variant from a CTk colour.
+
+    CustomTkinter colours are often a [light, dark] pair; raw tkinter canvases
+    can't use that, so resolve to a single value for the current mode.
+    """
+    if isinstance(color, (list, tuple)):
+        return color[0] if ctk.get_appearance_mode() == "Light" else color[1]
+    return color
+
+
 class CenteredBar(tk.Canvas):
-    """A horizontal gauge that fills left or right from a centre line."""
+    """A horizontal gauge that fills left or right from a centre line.
+
+    Because this is a raw tkinter Canvas (not a CTk widget) it does NOT follow
+    set_appearance_mode automatically, so it recomputes its colours from the
+    current mode on every draw and exposes refresh_theme() for the toggle.
+    """
 
     def __init__(self, master, width=360, height=42, vmin=-45, vmax=45,
-                 fill="#3b8ed0", bg="#1c1c24", **kwargs):
+                 fill="#3b8ed0", **kwargs):
         super().__init__(master, width=width, height=height,
-                         highlightthickness=0, bg=bg, **kwargs)
+                         highlightthickness=0, **kwargs)
+        self.master_frame = master
         self.w, self.h = width, height
         self.vmin, self.vmax = vmin, vmax
         self.fill_color = fill
         self.value = 0
         self.bind("<Configure>", lambda e: self._draw())
-        self._draw()
+        self.refresh_theme()
 
     def set_value(self, v):
         self.value = max(self.vmin, min(self.vmax, v))
         self._draw()
 
+    def refresh_theme(self):
+        """Match the canvas background to the parent card and redraw."""
+        self.configure(bg=self._bg_color())
+        self._draw()
+
+    def _bg_color(self):
+        try:
+            c = _resolve_color(self.master_frame.cget("fg_color"))
+        except Exception:
+            c = None
+        if not c or c == "transparent":
+            return "#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#dbdbdb"
+        return c
+
+    def _palette(self):
+        if ctk.get_appearance_mode() == "Light":
+            return {"track": "#c9c9cf", "tick": "#9a9aa5",
+                    "center": "#55555f", "knob": "#ffffff"}
+        return {"track": "#2a2a36", "tick": "#4a4a5a",
+                "center": "#8a8aa0", "knob": "#ffffff"}
+
     def _draw(self):
         self.delete("all")
+        pal = self._palette()
         w = self.winfo_width() or self.w
         h = self.winfo_height() or self.h
         pad = 12
@@ -154,14 +208,14 @@ class CenteredBar(tk.Canvas):
         top, bot = cy - track_h / 2, cy + track_h / 2
 
         # background track
-        self.create_rectangle(left, top, right, bot, fill="#2a2a36",
+        self.create_rectangle(left, top, right, bot, fill=pal["track"],
                               outline="")
         # ticks at min / centre / max
         for frac in (0.0, 0.5, 1.0):
             x = left + frac * (right - left)
-            self.create_line(x, top - 5, x, bot + 5, fill="#4a4a5a", width=1)
+            self.create_line(x, top - 5, x, bot + 5, fill=pal["tick"], width=1)
         # centre line emphasised
-        self.create_line(cx, top - 7, cx, bot + 7, fill="#8a8aa0", width=2)
+        self.create_line(cx, top - 7, cx, bot + 7, fill=pal["center"], width=2)
 
         # fill from centre toward the value
         if self.value >= 0:
@@ -175,7 +229,8 @@ class CenteredBar(tk.Canvas):
         # knob
         r = 7
         self.create_oval(x - r, cy - r, x + r, cy + r,
-                         fill="#ffffff", outline=self.fill_color, width=2)
+                         fill=self._palette()["knob"], outline=self.fill_color,
+                         width=2)
 
 
 # --------------------------------------------------------------------------- #
@@ -215,7 +270,8 @@ class SerialReader(threading.Thread):
 # --------------------------------------------------------------------------- #
 
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "460800"]
-MAX_LOG_LINES = 2000
+MAX_LOG_LINES = 20000
+PORT_POLL_MS = 1000  # how often to scan for COM-port hot-plug / unplug
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -237,6 +293,9 @@ class App(ctk.CTk):
         self.port_map = {}  # display string -> device name
         self.telemetry_labels = {}  # key -> value label widget
         self.last_rx_time = None
+        self.known_devices = None    # set of COM device names; None until 1st scan
+        self.auto_target = None      # ST-Link device we want to auto-connect to
+        self._auto_fail_logged = set()  # devices whose open failure we've logged
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
@@ -248,6 +307,7 @@ class App(ctk.CTk):
         self.refresh_ports()
         self.after(50, self.poll_queue)
         self.after(1000, self.update_stale_indicator)
+        self.after(300, self.watch_ports)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ----- top: connection controls --------------------------------------- #
@@ -280,6 +340,18 @@ class App(ctk.CTk):
             bar, text="\u25cb  Disconnected", text_color="#d05b5b",
             font=ctk.CTkFont(size=14, weight="bold"))
         self.status_label.grid(row=0, column=6, padx=(18, 12), sticky="e")
+
+        self.autoconnect = ctk.CTkCheckBox(
+            bar, text="Auto-connect when an ST-Link COM port is plugged in")
+        self.autoconnect.select()
+        self.autoconnect.grid(row=1, column=0, columnspan=6, padx=12,
+                              pady=(0, 10), sticky="w")
+
+        self.dark_switch = ctk.CTkSwitch(
+            bar, text="Dark Mode", command=self.toggle_appearance)
+        self.dark_switch.select()  # app starts in dark mode
+        self.dark_switch.grid(row=1, column=6, padx=(6, 12), pady=(0, 10),
+                              sticky="e")
 
     # ----- middle: controller + telemetry --------------------------------- #
     def _build_panels(self):
@@ -428,6 +500,67 @@ class App(ctk.CTk):
             if self.port_combo.get() not in self.port_map:
                 self.port_combo.set(display[0])
 
+    # ----- appearance ----------------------------------------------------- #
+    def toggle_appearance(self):
+        """Switch between light and dark mode.
+
+        CTk widgets re-theme themselves, but the raw-canvas gauges don't, so
+        they're refreshed explicitly here.
+        """
+        mode = "dark" if self.dark_switch.get() else "light"
+        ctk.set_appearance_mode(mode)
+        self.sail_bar.refresh_theme()
+        self.rudder_bar.refresh_theme()
+
+    # ----- COM-port hot-plug watcher -------------------------------------- #
+    def watch_ports(self):
+        """Periodically scan COM ports; auto-connect to a new ST-Link.
+
+        Runs on the main thread via .after(). The first pass only records a
+        baseline of the ports already present, so we do NOT auto-grab a board
+        that was already plugged in before the program started -- only devices
+        that appear *after* launch (i.e. get plugged in, or unplugged and
+        re-plugged) trigger an auto-connect.
+        """
+        ports = {p.device: p for p in serial.tools.list_ports.comports()}
+        devices = set(ports)
+
+        # First run: just take the baseline, don't act.
+        if self.known_devices is None:
+            self.known_devices = devices
+            self.after(PORT_POLL_MS, self.watch_ports)
+            return
+
+        added = devices - self.known_devices
+        removed = self.known_devices - devices
+        self.known_devices = devices
+
+        # Keep the dropdown in sync whenever hardware comes or goes.
+        if added or removed:
+            self.refresh_ports()
+
+        # A newly appeared ST-Link becomes the device we want to connect to.
+        for dev in sorted(added):
+            if is_stlink(ports[dev]):
+                self.auto_target = dev
+                self._auto_fail_logged.discard(dev)
+                self.append_log(f"** ST-Link detected on {dev} **")
+
+        # If the target got unplugged before we connected, forget it.
+        if self.auto_target and self.auto_target not in devices:
+            self.auto_target = None
+
+        # Try to connect (and keep retrying) while we have a target and are idle.
+        connected = self.ser is not None and self.ser.is_open
+        if self.autoconnect.get() and not connected and self.auto_target:
+            ok = self.connect(device=self.auto_target, quiet=True)
+            if not ok and self.auto_target not in self._auto_fail_logged:
+                self.append_log(
+                    f"** Could not open {self.auto_target} yet; retrying... **")
+                self._auto_fail_logged.add(self.auto_target)
+
+        self.after(PORT_POLL_MS, self.watch_ports)
+
     # ----- connect / disconnect ------------------------------------------- #
     def toggle_connection(self):
         if self.ser and self.ser.is_open:
@@ -435,12 +568,21 @@ class App(ctk.CTk):
         else:
             self.connect()
 
-    def connect(self):
-        sel = self.port_combo.get()
-        device = self.port_map.get(sel)
+    def connect(self, device=None, quiet=False):
+        """Open the serial port. Returns True on success.
+
+        device : explicit COM device name (used by the auto-connect watcher).
+                 When None, the device is taken from the dropdown selection.
+        quiet  : when True, suppress the "could not open" log line so the
+                 retrying watcher doesn't spam the log on a busy port.
+        """
+        if device is None:
+            sel = self.port_combo.get()
+            device = self.port_map.get(sel)
         if not device:
-            self.append_log("** No valid COM port selected. Click Refresh. **")
-            return
+            if not quiet:
+                self.append_log("** No valid COM port selected. Click Refresh. **")
+            return False
         try:
             baud = int(self.baud_combo.get())
         except ValueError:
@@ -448,9 +590,16 @@ class App(ctk.CTk):
         try:
             self.ser = serial.Serial(device, baud, timeout=0.2)
         except (serial.SerialException, OSError) as e:
-            self.append_log(f"** Could not open {device}: {e} **")
+            if not quiet:
+                self.append_log(f"** Could not open {device}: {e} **")
             self.ser = None
-            return
+            return False
+
+        # reflect the connected device in the dropdown
+        for label, dev in self.port_map.items():
+            if dev == device:
+                self.port_combo.set(label)
+                break
 
         self.stop_event = threading.Event()
         self.reader = SerialReader(self.ser, self.queue, self.stop_event)
@@ -462,6 +611,7 @@ class App(ctk.CTk):
         self.baud_combo.configure(state="disabled")
         self.refresh_btn.configure(state="disabled")
         self.append_log(f"** Connected to {device} @ {baud} baud **")
+        return True
 
     def disconnect(self):
         if self.stop_event:
@@ -476,6 +626,10 @@ class App(ctk.CTk):
         self.ser = None
         self.reader = None
         self.stop_event = None
+        # A manual disconnect (or a cable pull) clears the auto-connect target,
+        # so the watcher won't immediately grab the same port again. It will
+        # only auto-connect after the device is unplugged and plugged back in.
+        self.auto_target = None
 
         self.connect_btn.configure(text="Connect")
         self.status_label.configure(text="\u25cb  Disconnected",
@@ -527,8 +681,10 @@ class App(ctk.CTk):
     def update_telemetry(self, d):
         for key, val_label in self.telemetry_labels.items():
             if key in d:
+                # ("light-mode colour", "dark-mode colour") so values stay
+                # readable in both themes; CTk picks and updates automatically.
                 val_label.configure(text=fmt_value(key, d[key]),
-                                    text_color="#ffffff")
+                                    text_color=("#1f1f1f", "#ffffff"))
         self.last_rx_time = datetime.now()
 
     def update_stale_indicator(self):
