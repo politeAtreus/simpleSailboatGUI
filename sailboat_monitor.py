@@ -1,0 +1,570 @@
+"""
+Sailboat Ground Station Monitor
+================================
+A CustomTkinter (Windows) GUI for monitoring the serial output of the
+STM32 joystick controller used in the autonomous boat project.
+
+It parses TWO kinds of lines that the controller prints over the COM port
+(this is the ST-Link / debug UART you are watching in PuTTY):
+
+1) Controller status line (printed continuously):
+
+       sail=-19  rudder=0  | dropped=0  overruns=0
+
+   - sail     : left-joystick sail command     (-45 .. +45)
+   - rudder   : right-joystick rudder command   (-45 .. +45)
+   - dropped  : dropped XBee packet counter
+   - overruns : UART / packet overrun counter
+
+2) Radio telemetry echoed back from the boat PCB (only when in range):
+
+       XBee RX: {"tb":0,"tlat":0,...,"wa":0"sa":347,}
+
+   NOTE: in the screenshot this payload is *almost* JSON but is slightly
+   malformed -- there is a missing comma between "wa":0 and "sa":347 and a
+   trailing comma before the closing brace. So we deliberately do NOT use
+   json.loads(); we use a tolerant "key":value regex that survives the
+   missing/extra commas and any field ordering.
+
+Requirements:
+    pip install customtkinter pyserial
+
+Run:
+    python sailboat_monitor.py
+"""
+
+import queue
+import re
+import threading
+import tkinter as tk
+from datetime import datetime
+
+import customtkinter as ctk
+import serial
+import serial.tools.list_ports
+
+# --------------------------------------------------------------------------- #
+# Parsing
+# --------------------------------------------------------------------------- #
+
+# sail=-19  rudder=0  | dropped=0  overruns=0
+SAIL_RUDDER_RE = re.compile(
+    r"sail\s*=\s*(-?\d+)\s+rudder\s*=\s*(-?\d+)\s*\|\s*"
+    r"dropped\s*=\s*(\d+)\s+overruns\s*=\s*(\d+)"
+)
+
+# Tolerant "key":value matcher.  Handles ints, floats and negatives.
+# It ignores commas entirely, so the malformed JSON in the screenshot
+# (missing comma / trailing comma) parses cleanly.
+KV_RE = re.compile(r'"([A-Za-z_]\w*)"\s*:\s*(-?\d+(?:\.\d+)?)')
+
+
+def parse_sail_rudder(line: str):
+    """Return dict for a controller status line, or None."""
+    m = SAIL_RUDDER_RE.search(line)
+    if not m:
+        return None
+    return {
+        "sail": int(m.group(1)),
+        "rudder": int(m.group(2)),
+        "dropped": int(m.group(3)),
+        "overruns": int(m.group(4)),
+    }
+
+
+def parse_xbee(line: str):
+    """Return dict of telemetry fields for an 'XBee RX:' line, or None."""
+    if "XBee RX" not in line:
+        return None
+    payload = line.split("XBee RX:", 1)[1]
+    pairs = KV_RE.findall(payload)
+    if not pairs:
+        return None
+    out = {}
+    for key, raw in pairs:
+        out[key] = float(raw) if "." in raw else int(raw)
+    return out
+
+
+# Telemetry field metadata.  The human-readable labels are my best guess
+# at your protocol (t* = target/setpoint, c* = current boat state); they
+# are easy to rename here without touching anything else.
+TELEMETRY_FIELDS = [
+    # key,    label,                 group
+    ("tb",   "Target Bearing",       "Target / Setpoints"),
+    ("tlat", "Target Latitude",      "Target / Setpoints"),
+    ("tlon", "Target Longitude",     "Target / Setpoints"),
+    ("tsa",  "Target Sail Angle",    "Target / Setpoints"),
+    ("tfa",  "Target Flap Angle",    "Target / Setpoints"),
+    ("tra",  "Target Rudder Angle",  "Target / Setpoints"),
+    ("clat", "Current Latitude",     "Boat State"),
+    ("clon", "Current Longitude",    "Boat State"),
+    ("cb",   "Current Bearing",      "Boat State"),
+    ("wa",   "Wind Angle",           "Boat State"),
+    ("sa",   "Sail Angle",           "Boat State"),
+]
+
+DEGREE_FIELDS = {"tb", "tsa", "tfa", "tra", "cb", "wa", "sa"}
+LATLON_FIELDS = {"tlat", "tlon", "clat", "clon"}
+
+
+def fmt_value(key: str, v) -> str:
+    if key in LATLON_FIELDS:
+        return f"{float(v):.6f}"
+    if isinstance(v, float):
+        s = f"{v:.2f}"
+    else:
+        s = str(v)
+    if key in DEGREE_FIELDS:
+        s += "\u00b0"
+    return s
+
+
+# --------------------------------------------------------------------------- #
+# Centered bar widget (for sail / rudder, which swing -45 .. +45 about zero)
+# --------------------------------------------------------------------------- #
+
+class CenteredBar(tk.Canvas):
+    """A horizontal gauge that fills left or right from a centre line."""
+
+    def __init__(self, master, width=360, height=42, vmin=-45, vmax=45,
+                 fill="#3b8ed0", bg="#1c1c24", **kwargs):
+        super().__init__(master, width=width, height=height,
+                         highlightthickness=0, bg=bg, **kwargs)
+        self.w, self.h = width, height
+        self.vmin, self.vmax = vmin, vmax
+        self.fill_color = fill
+        self.value = 0
+        self.bind("<Configure>", lambda e: self._draw())
+        self._draw()
+
+    def set_value(self, v):
+        self.value = max(self.vmin, min(self.vmax, v))
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = self.winfo_width() or self.w
+        h = self.winfo_height() or self.h
+        pad = 12
+        track_h = 14
+        cx = w / 2
+        cy = h / 2
+        left, right = pad, w - pad
+        top, bot = cy - track_h / 2, cy + track_h / 2
+
+        # background track
+        self.create_rectangle(left, top, right, bot, fill="#2a2a36",
+                              outline="")
+        # ticks at min / centre / max
+        for frac in (0.0, 0.5, 1.0):
+            x = left + frac * (right - left)
+            self.create_line(x, top - 5, x, bot + 5, fill="#4a4a5a", width=1)
+        # centre line emphasised
+        self.create_line(cx, top - 7, cx, bot + 7, fill="#8a8aa0", width=2)
+
+        # fill from centre toward the value
+        if self.value >= 0:
+            x = cx + (self.value / self.vmax) * (right - cx)
+            self.create_rectangle(cx, top, x, bot, fill=self.fill_color,
+                                  outline="")
+        else:
+            x = cx - (self.value / self.vmin) * (cx - left)
+            self.create_rectangle(x, top, cx, bot, fill=self.fill_color,
+                                  outline="")
+        # knob
+        r = 7
+        self.create_oval(x - r, cy - r, x + r, cy + r,
+                         fill="#ffffff", outline=self.fill_color, width=2)
+
+
+# --------------------------------------------------------------------------- #
+# Serial reader thread
+# --------------------------------------------------------------------------- #
+
+class SerialReader(threading.Thread):
+    """Reads complete lines off the serial port and pushes them to a queue.
+
+    Runs in a background thread so the GUI never blocks.  All widget updates
+    happen on the main thread via App.poll_queue(), because tkinter is not
+    thread-safe.
+    """
+
+    def __init__(self, ser, out_queue, stop_event):
+        super().__init__(daemon=True)
+        self.ser = ser
+        self.out_queue = out_queue
+        self.stop_event = stop_event
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                raw = self.ser.readline()  # blocks up to the port timeout
+            except (serial.SerialException, OSError) as e:
+                self.out_queue.put(("error", f"Serial error: {e}"))
+                return
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip("\r\n")
+            if line:
+                self.out_queue.put(("line", line))
+
+
+# --------------------------------------------------------------------------- #
+# Main application
+# --------------------------------------------------------------------------- #
+
+BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "460800"]
+MAX_LOG_LINES = 2000
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("dark-blue")
+
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Sailboat Ground Station Monitor")
+        self.geometry("1120x760")
+        self.minsize(960, 640)
+
+        # serial state
+        self.ser = None
+        self.reader = None
+        self.stop_event = None
+        self.queue = queue.Queue()
+        self.port_map = {}  # display string -> device name
+        self.telemetry_labels = {}  # key -> value label widget
+        self.last_rx_time = None
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        self._build_connection_bar()
+        self._build_panels()
+        self._build_log()
+
+        self.refresh_ports()
+        self.after(50, self.poll_queue)
+        self.after(1000, self.update_stale_indicator)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ----- top: connection controls --------------------------------------- #
+    def _build_connection_bar(self):
+        bar = ctk.CTkFrame(self, corner_radius=10)
+        bar.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        for i in range(7):
+            bar.grid_columnconfigure(i, weight=0)
+        bar.grid_columnconfigure(6, weight=1)
+
+        ctk.CTkLabel(bar, text="COM Port:").grid(
+            row=0, column=0, padx=(12, 6), pady=10)
+        self.port_combo = ctk.CTkComboBox(bar, values=["(no ports)"], width=320)
+        self.port_combo.grid(row=0, column=1, padx=6, pady=10)
+
+        self.refresh_btn = ctk.CTkButton(
+            bar, text="\u21bb Refresh", width=90, command=self.refresh_ports)
+        self.refresh_btn.grid(row=0, column=2, padx=6, pady=10)
+
+        ctk.CTkLabel(bar, text="Baud:").grid(row=0, column=3, padx=(18, 6))
+        self.baud_combo = ctk.CTkComboBox(bar, values=BAUD_RATES, width=110)
+        self.baud_combo.set("115200")
+        self.baud_combo.grid(row=0, column=4, padx=6, pady=10)
+
+        self.connect_btn = ctk.CTkButton(
+            bar, text="Connect", width=120, command=self.toggle_connection)
+        self.connect_btn.grid(row=0, column=5, padx=6, pady=10)
+
+        self.status_label = ctk.CTkLabel(
+            bar, text="\u25cb  Disconnected", text_color="#d05b5b",
+            font=ctk.CTkFont(size=14, weight="bold"))
+        self.status_label.grid(row=0, column=6, padx=(18, 12), sticky="e")
+
+    # ----- middle: controller + telemetry --------------------------------- #
+    def _build_panels(self):
+        wrap = ctk.CTkFrame(self, fg_color="transparent")
+        wrap.grid(row=1, column=0, sticky="ew", padx=12, pady=6)
+        wrap.grid_columnconfigure(0, weight=1, uniform="cols")
+        wrap.grid_columnconfigure(1, weight=1, uniform="cols")
+
+        self._build_controller_card(wrap)
+        self._build_telemetry_card(wrap)
+
+    def _build_controller_card(self, parent):
+        card = ctk.CTkFrame(parent, corner_radius=10)
+        card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(card, text="Controller Output",
+                     font=ctk.CTkFont(size=16, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 8))
+
+        # Sail
+        srow = ctk.CTkFrame(card, fg_color="transparent")
+        srow.grid(row=1, column=0, sticky="ew", padx=16, pady=(4, 0))
+        srow.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(srow, text="Sail (left stick)",
+                     font=ctk.CTkFont(size=13)).grid(row=0, column=0, sticky="w")
+        self.sail_value = ctk.CTkLabel(
+            srow, text="0", font=ctk.CTkFont(size=22, weight="bold"),
+            text_color="#3b8ed0")
+        self.sail_value.grid(row=0, column=1, sticky="e")
+        self.sail_bar = CenteredBar(card, fill="#3b8ed0")
+        self.sail_bar.grid(row=2, column=0, sticky="ew", padx=16, pady=(2, 10))
+
+        # Rudder
+        rrow = ctk.CTkFrame(card, fg_color="transparent")
+        rrow.grid(row=3, column=0, sticky="ew", padx=16, pady=(4, 0))
+        rrow.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(rrow, text="Rudder (right stick)",
+                     font=ctk.CTkFont(size=13)).grid(row=0, column=0, sticky="w")
+        self.rudder_value = ctk.CTkLabel(
+            rrow, text="0", font=ctk.CTkFont(size=22, weight="bold"),
+            text_color="#e8a33d")
+        self.rudder_value.grid(row=0, column=1, sticky="e")
+        self.rudder_bar = CenteredBar(card, fill="#e8a33d")
+        self.rudder_bar.grid(row=4, column=0, sticky="ew", padx=16, pady=(2, 14))
+
+        # Packet stats
+        stats = ctk.CTkFrame(card)
+        stats.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 16))
+        stats.grid_columnconfigure((0, 1), weight=1)
+        self.dropped_label = self._stat_box(stats, 0, "Dropped", "0", "#d0a23b")
+        self.overruns_label = self._stat_box(stats, 1, "Overruns", "0", "#d05b5b")
+
+    def _stat_box(self, parent, col, title, value, color):
+        box = ctk.CTkFrame(parent, corner_radius=8)
+        box.grid(row=0, column=col, sticky="ew", padx=4, pady=4)
+        box.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(box, text=title,
+                     font=ctk.CTkFont(size=12)).grid(row=0, column=0, pady=(8, 0))
+        val = ctk.CTkLabel(box, text=value,
+                           font=ctk.CTkFont(size=24, weight="bold"),
+                           text_color=color)
+        val.grid(row=1, column=0, pady=(0, 8))
+        return val
+
+    def _build_telemetry_card(self, parent):
+        card = ctk.CTkFrame(parent, corner_radius=10)
+        card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        card.grid_columnconfigure(0, weight=1)
+
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="Sailboat Telemetry (XBee RX)",
+                     font=ctk.CTkFont(size=16, weight="bold")).grid(
+            row=0, column=0, sticky="w")
+        self.rx_age_label = ctk.CTkLabel(head, text="no data",
+                                         text_color="#888",
+                                         font=ctk.CTkFont(size=12))
+        self.rx_age_label.grid(row=0, column=1, sticky="e")
+
+        row = 1
+        current_group = None
+        for key, label, group in TELEMETRY_FIELDS:
+            if group != current_group:
+                current_group = group
+                ctk.CTkLabel(card, text=group,
+                             font=ctk.CTkFont(size=12, weight="bold"),
+                             text_color="#7a9fce").grid(
+                    row=row, column=0, sticky="w", padx=16, pady=(10, 2))
+                row += 1
+            field = ctk.CTkFrame(card, fg_color="transparent")
+            field.grid(row=row, column=0, sticky="ew", padx=16, pady=1)
+            field.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(field, text=f"{label}  ({key})",
+                         font=ctk.CTkFont(size=13),
+                         anchor="w").grid(row=0, column=0, sticky="w")
+            val = ctk.CTkLabel(field, text="\u2014",
+                               font=ctk.CTkFont(size=15, weight="bold"),
+                               anchor="e")
+            val.grid(row=0, column=1, sticky="e")
+            self.telemetry_labels[key] = val
+            row += 1
+
+    # ----- bottom: raw log ------------------------------------------------- #
+    def _build_log(self):
+        card = ctk.CTkFrame(self, corner_radius=10)
+        card.grid(row=2, column=0, sticky="nsew", padx=12, pady=(6, 12))
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(1, weight=1)
+
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="Raw Serial Log",
+                     font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=0, column=0, sticky="w")
+        self.autoscroll = ctk.CTkCheckBox(head, text="Auto-scroll")
+        self.autoscroll.select()
+        self.autoscroll.grid(row=0, column=1, padx=8)
+        ctk.CTkButton(head, text="Clear", width=80,
+                      command=self.clear_log).grid(row=0, column=2, padx=4)
+
+        self.log = ctk.CTkTextbox(card, font=ctk.CTkFont(
+            family="Consolas", size=12))
+        self.log.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.log.configure(state="disabled")
+
+    # ----- port handling --------------------------------------------------- #
+    def refresh_ports(self):
+        ports = serial.tools.list_ports.comports()
+        self.port_map.clear()
+        display = []
+        for p in ports:
+            desc = p.description or "Unknown device"
+            label = f"{p.device} \u2014 {desc}"
+            self.port_map[label] = p.device
+            display.append(label)
+        if not display:
+            display = ["(no ports found)"]
+            self.port_combo.configure(values=display)
+            self.port_combo.set(display[0])
+        else:
+            self.port_combo.configure(values=display)
+            # keep current selection if still present, else pick first
+            if self.port_combo.get() not in self.port_map:
+                self.port_combo.set(display[0])
+
+    # ----- connect / disconnect ------------------------------------------- #
+    def toggle_connection(self):
+        if self.ser and self.ser.is_open:
+            self.disconnect()
+        else:
+            self.connect()
+
+    def connect(self):
+        sel = self.port_combo.get()
+        device = self.port_map.get(sel)
+        if not device:
+            self.append_log("** No valid COM port selected. Click Refresh. **")
+            return
+        try:
+            baud = int(self.baud_combo.get())
+        except ValueError:
+            baud = 115200
+        try:
+            self.ser = serial.Serial(device, baud, timeout=0.2)
+        except (serial.SerialException, OSError) as e:
+            self.append_log(f"** Could not open {device}: {e} **")
+            self.ser = None
+            return
+
+        self.stop_event = threading.Event()
+        self.reader = SerialReader(self.ser, self.queue, self.stop_event)
+        self.reader.start()
+
+        self.connect_btn.configure(text="Disconnect")
+        self.status_label.configure(text="\u25cf  Connected", text_color="#4caf72")
+        self.port_combo.configure(state="disabled")
+        self.baud_combo.configure(state="disabled")
+        self.refresh_btn.configure(state="disabled")
+        self.append_log(f"** Connected to {device} @ {baud} baud **")
+
+    def disconnect(self):
+        if self.stop_event:
+            self.stop_event.set()
+        if self.reader and self.reader.is_alive():
+            self.reader.join(timeout=1.0)
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+        self.ser = None
+        self.reader = None
+        self.stop_event = None
+
+        self.connect_btn.configure(text="Connect")
+        self.status_label.configure(text="\u25cb  Disconnected",
+                                    text_color="#d05b5b")
+        self.port_combo.configure(state="normal")
+        self.baud_combo.configure(state="normal")
+        self.refresh_btn.configure(state="normal")
+        self.append_log("** Disconnected **")
+
+    # ----- queue pump (main thread) --------------------------------------- #
+    def poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.queue.get_nowait()
+                if kind == "line":
+                    self.handle_line(payload)
+                elif kind == "error":
+                    self.append_log(f"** {payload} **")
+                    self.disconnect()
+        except queue.Empty:
+            pass
+        self.after(50, self.poll_queue)
+
+    def handle_line(self, line: str):
+        self.append_log(line)
+
+        sr = parse_sail_rudder(line)
+        if sr is not None:
+            self.update_controller(sr)
+            return
+
+        tel = parse_xbee(line)
+        if tel is not None:
+            self.update_telemetry(tel)
+
+    def update_controller(self, d):
+        self.sail_value.configure(text=str(d["sail"]))
+        self.sail_bar.set_value(d["sail"])
+        self.rudder_value.configure(text=str(d["rudder"]))
+        self.rudder_bar.set_value(d["rudder"])
+        self.dropped_label.configure(text=str(d["dropped"]))
+        self.overruns_label.configure(text=str(d["overruns"]))
+        # colour the counters if anything is non-zero
+        self.dropped_label.configure(
+            text_color="#d05b5b" if d["dropped"] else "#d0a23b")
+        self.overruns_label.configure(
+            text_color="#d05b5b" if d["overruns"] else "#6c9c6c")
+
+    def update_telemetry(self, d):
+        for key, val_label in self.telemetry_labels.items():
+            if key in d:
+                val_label.configure(text=fmt_value(key, d[key]),
+                                    text_color="#ffffff")
+        self.last_rx_time = datetime.now()
+
+    def update_stale_indicator(self):
+        if self.last_rx_time is None:
+            self.rx_age_label.configure(text="no data", text_color="#888")
+        else:
+            age = (datetime.now() - self.last_rx_time).total_seconds()
+            if age < 2:
+                self.rx_age_label.configure(text="live", text_color="#4caf72")
+            else:
+                self.rx_age_label.configure(
+                    text=f"stale ({int(age)}s ago)", text_color="#d0a23b")
+        self.after(1000, self.update_stale_indicator)
+
+    # ----- log helpers ----------------------------------------------------- #
+    def append_log(self, text: str):
+        self.log.configure(state="normal")
+        self.log.insert("end", text + "\n")
+        # trim to keep memory bounded
+        line_count = int(self.log.index("end-1c").split(".")[0])
+        if line_count > MAX_LOG_LINES:
+            self.log.delete("1.0", f"{line_count - MAX_LOG_LINES}.0")
+        if self.autoscroll.get():
+            self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def clear_log(self):
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+
+    # ----- shutdown -------------------------------------------------------- #
+    def on_close(self):
+        self.disconnect()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    App().mainloop()
