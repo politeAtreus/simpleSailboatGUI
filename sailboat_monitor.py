@@ -33,6 +33,7 @@ Run:
     python sailboat_monitor.py
 """
 
+import math
 import queue
 import re
 import threading
@@ -234,6 +235,125 @@ class CenteredBar(tk.Canvas):
 
 
 # --------------------------------------------------------------------------- #
+# Boat view widget (top-down schematic: sail pivots at centre, rudder at stern)
+# --------------------------------------------------------------------------- #
+
+class BoatView(tk.Canvas):
+    """Top-down boat schematic. Bow points up.
+
+    The sail rotates about the mast at the centre of the hull and the rudder
+    rotates about its pivot at the stern, both driven by the live joystick
+    angles (-45 .. +45 deg). Positive angle swings to starboard (right).
+    """
+
+    SAIL_COLOR = "#3b8ed0"     # matches the sail gauge / value
+    RUDDER_COLOR = "#e8a33d"   # matches the rudder gauge / value
+
+    def __init__(self, master, width=300, height=240, **kwargs):
+        super().__init__(master, width=width, height=height,
+                         highlightthickness=0, **kwargs)
+        self.master_frame = master
+        self.w, self.h = width, height
+        self.sail_angle = 0.0
+        self.rudder_angle = 0.0
+        self.bind("<Configure>", lambda e: self._draw())
+        self.refresh_theme()
+
+    def set_angles(self, sail, rudder):
+        self.sail_angle = float(sail)
+        self.rudder_angle = float(rudder)
+        self._draw()
+
+    def refresh_theme(self):
+        self.configure(bg=self._bg_color())
+        self._draw()
+
+    def _bg_color(self):
+        try:
+            c = _resolve_color(self.master_frame.cget("fg_color"))
+        except Exception:
+            c = None
+        if not c or c == "transparent":
+            return "#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#dbdbdb"
+        return c
+
+    def _palette(self):
+        if ctk.get_appearance_mode() == "Light":
+            return {"hull": "#c2c6cf", "outline": "#5a5a66", "pivot": "#3a3a44",
+                    "label": "#55555f"}
+        return {"hull": "#3a3a48", "outline": "#9a9aac", "pivot": "#dcdce6",
+                "label": "#9a9aa5"}
+
+    @staticmethod
+    def _rotate(px, py, cx, cy, deg):
+        """Rotate (px,py) about (cx,cy). 0 deg = straight aft (downward),
+        positive = toward starboard (screen right) to match the gauges, which
+        fill right for positive values. The angle is negated because the canvas
+        y-axis points down."""
+        r = math.radians(-deg)
+        dx, dy = px - cx, py - cy
+        rx = dx * math.cos(r) - dy * math.sin(r)
+        ry = dx * math.sin(r) + dy * math.cos(r)
+        return cx + rx, cy + ry
+
+    def _draw(self):
+        self.delete("all")
+        pal = self._palette()
+        w = self.winfo_width() or self.w
+        h = self.winfo_height() or self.h
+        cx = w / 2
+        cy = h * 0.45          # shift up so the rudder has room below
+        L = h * 0.30           # hull half-length
+        W = min(w * 0.16, L * 0.55)  # hull half-width
+
+        # ---- hull (smoothed polygon, bow at top) ----
+        hull = [
+            cx, cy - L,                        # bow tip
+            cx + W * 0.85, cy - L * 0.40,
+            cx + W, cy + L * 0.15,
+            cx + W * 0.70, cy + L * 0.80,
+            cx + W * 0.65, cy + L,             # starboard stern
+            cx - W * 0.65, cy + L,             # port stern
+            cx - W * 0.70, cy + L * 0.80,
+            cx - W, cy + L * 0.15,
+            cx - W * 0.85, cy - L * 0.40,
+        ]
+        self.create_polygon(hull, fill=pal["hull"], outline=pal["outline"],
+                            width=2, smooth=True)
+
+        # ---- mast + sail (pivots at hull centre) ----
+        mast_x, mast_y = cx, cy
+        boom_len = L * 0.85
+        tip = self._rotate(mast_x, mast_y + boom_len, mast_x, mast_y,
+                           self.sail_angle)
+        self.create_line(mast_x, mast_y, tip[0], tip[1],
+                        fill=self.SAIL_COLOR, width=7, capstyle="round")
+        self.create_oval(mast_x - 5, mast_y - 5, mast_x + 5, mast_y + 5,
+                        fill=pal["pivot"], outline="")
+
+        # ---- rudder (pivots at the stern) ----
+        rud_x, rud_y = cx, cy + L
+        rud_len = L * 0.45
+        rtip = self._rotate(rud_x, rud_y + rud_len, rud_x, rud_y,
+                           self.rudder_angle)
+        self.create_line(rud_x, rud_y, rtip[0], rtip[1],
+                        fill=self.RUDDER_COLOR, width=6, capstyle="round")
+        self.create_oval(rud_x - 4, rud_y - 4, rud_x + 4, rud_y + 4,
+                        fill=pal["pivot"], outline="")
+
+        # ---- small captions ----
+        self.create_text(cx, cy - L - 10, text="BOW", fill=pal["label"],
+                        font=("TkDefaultFont", 8))
+        self.create_text(cx + W + 14, mast_y, text=f"Sail {self.sail_angle:.0f}\u00b0",
+                        fill=self.SAIL_COLOR, font=("TkDefaultFont", 9, "bold"),
+                        anchor="w")
+        self.create_text(cx + 12, rud_y + rud_len * 0.6,
+                        text=f"Rudder {self.rudder_angle:.0f}\u00b0",
+                        fill=self.RUDDER_COLOR,
+                        font=("TkDefaultFont", 9, "bold"), anchor="w")
+
+
+# --------------------------------------------------------------------------- #
 # Serial reader thread
 # --------------------------------------------------------------------------- #
 
@@ -272,6 +392,11 @@ class SerialReader(threading.Thread):
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "460800"]
 MAX_LOG_LINES = 20000
 PORT_POLL_MS = 1000  # how often to scan for COM-port hot-plug / unplug
+
+# Encoder reading (telemetry 'sa') that corresponds to the sail being centred.
+# MUST match SAIL_CENTER_DEG in the boat firmware (motor_control.c) so the
+# drawn sail deflection lines up with the physical sail.
+SAIL_CENTER_DEG = 180.0
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -400,10 +525,16 @@ class App(ctk.CTk):
 
         # Packet stats
         stats = ctk.CTkFrame(card)
-        stats.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 16))
+        stats.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 12))
         stats.grid_columnconfigure((0, 1), weight=1)
         self.dropped_label = self._stat_box(stats, 0, "Dropped", "0", "#d0a23b")
         self.overruns_label = self._stat_box(stats, 1, "Overruns", "0", "#d05b5b")
+
+        # Boat schematic (top-down)
+        self.boat_view = BoatView(card)
+        self.boat_view.grid(row=6, column=0, sticky="nsew", padx=16,
+                            pady=(0, 16))
+        card.grid_rowconfigure(6, weight=1)
 
     def _stat_box(self, parent, col, title, value, color):
         box = ctk.CTkFrame(parent, corner_radius=8)
@@ -511,6 +642,7 @@ class App(ctk.CTk):
         ctk.set_appearance_mode(mode)
         self.sail_bar.refresh_theme()
         self.rudder_bar.refresh_theme()
+        self.boat_view.refresh_theme()
 
     # ----- COM-port hot-plug watcher -------------------------------------- #
     def watch_ports(self):
@@ -685,6 +817,21 @@ class App(ctk.CTk):
                 # readable in both themes; CTk picks and updates automatically.
                 val_label.configure(text=fmt_value(key, d[key]),
                                     text_color=("#1f1f1f", "#ffffff"))
+
+        # Drive the boat schematic from the boat's *actual* reported angles:
+        #  - sail:   'sa' = AS5600 encoder (0-360), converted to deflection
+        #            about SAIL_CENTER_DEG and wrapped into [-180, 180).
+        #  - rudder: 'tra' = target rudder angle. The rudder is an open-loop
+        #            servo with no feedback, so this commanded value is the
+        #            only rudder position the PCB reports.
+        sail = self.boat_view.sail_angle
+        rudder = self.boat_view.rudder_angle
+        if "sa" in d:
+            sail = ((d["sa"] - SAIL_CENTER_DEG + 180.0) % 360.0) - 180.0
+        if "tra" in d:
+            rudder = d["tra"]
+        self.boat_view.set_angles(sail, rudder)
+
         self.last_rx_time = datetime.now()
 
     def update_stale_indicator(self):
