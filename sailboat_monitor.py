@@ -37,6 +37,7 @@ import math
 import queue
 import re
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 
@@ -312,8 +313,8 @@ class BoatView(tk.Canvas):
             cx + W * 0.85, cy - L * 0.40,
             cx + W, cy + L * 0.15,
             cx + W * 0.70, cy + L * 0.80,
-            cx + W * 0.65, cy + L,             # starboard stern
-            cx - W * 0.65, cy + L,             # port stern
+            cx + W * 0.45, cy + L,             # starboard stern
+            cx - W * 0.45, cy + L,             # port stern
             cx - W * 0.70, cy + L * 0.80,
             cx - W, cy + L * 0.15,
             cx - W * 0.85, cy - L * 0.40,
@@ -390,13 +391,20 @@ class SerialReader(threading.Thread):
 # --------------------------------------------------------------------------- #
 
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "460800"]
-MAX_LOG_LINES = 20000
-PORT_POLL_MS = 1000  # how often to scan for COM-port hot-plug / unplug
+MAX_LOG_LINES = 2000
+PORT_POLL_MS = 1500  # how often to scan for COM-port hot-plug / unplug
 
 # Encoder reading (telemetry 'sa') that corresponds to the sail being centred.
 # MUST match SAIL_CENTER_DEG in the boat firmware (motor_control.c) so the
 # drawn sail deflection lines up with the physical sail.
 SAIL_CENTER_DEG = 180.0
+
+# The sail is a continuous-rotation drive, not a positional servo: a negative
+# command spins it anti-clockwise (viewed from above), a positive command spins
+# it clockwise, both at a constant slew rate. The COMMANDED boat integrates this
+# over real time instead of treating the stick value as an angle.
+SAIL_ROTATION_RATE_DPS = 72.0  # degrees per second
+SAIL_CMD_DEADBAND = 2.0        # |command| below this is treated as "stop"
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -421,6 +429,11 @@ class App(ctk.CTk):
         self.known_devices = None    # set of COM device names; None until 1st scan
         self.auto_target = None      # ST-Link device we want to auto-connect to
         self._auto_fail_logged = set()  # devices whose open failure we've logged
+        # Commanded-sail animation state (continuous-rotation model)
+        self.cmd_sail_input = 0.0    # latest sail stick command (-45..+45)
+        self.cmd_sail_angle = 0.0    # integrated displayed sail angle
+        self.cmd_rudder = 0.0        # latest rudder command (positional)
+        self._last_sail_tick = None  # time.monotonic() of last animation frame
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
@@ -433,6 +446,7 @@ class App(ctk.CTk):
         self.after(50, self.poll_queue)
         self.after(1000, self.update_stale_indicator)
         self.after(300, self.watch_ports)
+        self.after(50, self.animate_commanded_sail)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ----- top: connection controls --------------------------------------- #
@@ -523,29 +537,50 @@ class App(ctk.CTk):
         self.rudder_bar = CenteredBar(card, fill="#e8a33d")
         self.rudder_bar.grid(row=4, column=0, sticky="ew", padx=16, pady=(2, 14))
 
-        # Packet stats
-        stats = ctk.CTkFrame(card)
-        stats.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 12))
+        # Packet stats (compact single row)
+        stats = ctk.CTkFrame(card, fg_color="transparent")
+        stats.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 6))
         stats.grid_columnconfigure((0, 1), weight=1)
-        self.dropped_label = self._stat_box(stats, 0, "Dropped", "0", "#d0a23b")
-        self.overruns_label = self._stat_box(stats, 1, "Overruns", "0", "#d05b5b")
+        self.dropped_label = self._stat_inline(stats, 0, "Dropped", "#d0a23b")
+        self.overruns_label = self._stat_inline(stats, 1, "Overruns", "#6c9c6c")
 
-        # Boat schematic (top-down)
-        self.boat_view = BoatView(card)
-        self.boat_view.grid(row=6, column=0, sticky="nsew", padx=16,
-                            pady=(0, 16))
+        # Boat schematics: commanded (your sticks) vs actual (from the boat)
+        boats = ctk.CTkFrame(card, fg_color="transparent")
+        boats.grid(row=6, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        boats.grid_columnconfigure((0, 1), weight=1, uniform="boats")
         card.grid_rowconfigure(6, weight=1)
 
-    def _stat_box(self, parent, col, title, value, color):
-        box = ctk.CTkFrame(parent, corner_radius=8)
-        box.grid(row=0, column=col, sticky="ew", padx=4, pady=4)
-        box.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(box, text=title,
-                     font=ctk.CTkFont(size=12)).grid(row=0, column=0, pady=(8, 0))
-        val = ctk.CTkLabel(box, text=value,
-                           font=ctk.CTkFont(size=24, weight="bold"),
-                           text_color=color)
-        val.grid(row=1, column=0, pady=(0, 8))
+        self.boat_cmd = self._build_boat_panel(
+            boats, 0, "Commanded", "from your joysticks")
+        self.boat_act = self._build_boat_panel(
+            boats, 1, "Actual", "reported by the boat")
+
+    def _build_boat_panel(self, parent, col, title, subtitle):
+        panel = ctk.CTkFrame(parent, corner_radius=8,
+                             fg_color=("#e6e6ec", "#26262e"))
+        panel.grid(row=0, column=col, sticky="nsew", padx=4)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(2, weight=1)
+        ctk.CTkLabel(panel, text=title,
+                     font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=0, column=0, pady=(8, 0))
+        ctk.CTkLabel(panel, text=subtitle, font=ctk.CTkFont(size=10),
+                     text_color=("gray45", "gray60")).grid(row=1, column=0)
+        bv = BoatView(panel, width=220, height=210)
+        bv.grid(row=2, column=0, sticky="nsew", padx=8, pady=(4, 10))
+        return bv
+
+    def _stat_inline(self, parent, col, title, color):
+        cell = ctk.CTkFrame(parent, fg_color="transparent")
+        cell.grid(row=0, column=col, sticky="ew", padx=4, pady=2)
+        cell.grid_columnconfigure(0, weight=1)
+        cell.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(cell, text=title, font=ctk.CTkFont(size=12),
+                     anchor="e").grid(row=0, column=0, sticky="e", padx=(0, 6))
+        val = ctk.CTkLabel(cell, text="0",
+                           font=ctk.CTkFont(size=15, weight="bold"),
+                           text_color=color, anchor="w")
+        val.grid(row=0, column=1, sticky="w")
         return val
 
     def _build_telemetry_card(self, parent):
@@ -642,7 +677,8 @@ class App(ctk.CTk):
         ctk.set_appearance_mode(mode)
         self.sail_bar.refresh_theme()
         self.rudder_bar.refresh_theme()
-        self.boat_view.refresh_theme()
+        self.boat_cmd.refresh_theme()
+        self.boat_act.refresh_theme()
 
     # ----- COM-port hot-plug watcher -------------------------------------- #
     def watch_ports(self):
@@ -762,6 +798,8 @@ class App(ctk.CTk):
         # so the watcher won't immediately grab the same port again. It will
         # only auto-connect after the device is unplugged and plugged back in.
         self.auto_target = None
+        # Stop the commanded sail from spinning once data stops arriving.
+        self.cmd_sail_input = 0.0
 
         self.connect_btn.configure(text="Connect")
         self.status_label.configure(text="\u25cb  Disconnected",
@@ -797,11 +835,40 @@ class App(ctk.CTk):
         if tel is not None:
             self.update_telemetry(tel)
 
+    def animate_commanded_sail(self):
+        """Advance the commanded boat's sail at a constant slew rate.
+
+        Continuous-rotation model: a positive command spins the sail clockwise
+        (viewed from above), a negative command anti-clockwise, both at
+        SAIL_ROTATION_RATE_DPS. In BoatView's frame, positive angle = starboard,
+        so clockwise (toward port) means the angle decreases -> rate = -sign(cmd).
+        The rudder is positional and applied as-is.
+        """
+        now = time.monotonic()
+        if self._last_sail_tick is None:
+            self._last_sail_tick = now
+        dt = now - self._last_sail_tick
+        self._last_sail_tick = now
+
+        if abs(self.cmd_sail_input) >= SAIL_CMD_DEADBAND:
+            direction = -1.0 if self.cmd_sail_input > 0 else 1.0
+            self.cmd_sail_angle += direction * SAIL_ROTATION_RATE_DPS * dt
+            # wrap into [-180, 180)
+            self.cmd_sail_angle = ((self.cmd_sail_angle + 180.0) % 360.0) - 180.0
+
+        self.boat_cmd.set_angles(self.cmd_sail_angle, self.cmd_rudder)
+        self.after(50, self.animate_commanded_sail)
+
     def update_controller(self, d):
         self.sail_value.configure(text=str(d["sail"]))
         self.sail_bar.set_value(d["sail"])
         self.rudder_value.configure(text=str(d["rudder"]))
         self.rudder_bar.set_value(d["rudder"])
+        # The sail command sets a rotation direction, not an angle; the boat
+        # drawing is advanced by animate_commanded_sail(). The rudder is
+        # positional, so it's applied directly.
+        self.cmd_sail_input = float(d["sail"])
+        self.cmd_rudder = float(d["rudder"])
         self.dropped_label.configure(text=str(d["dropped"]))
         self.overruns_label.configure(text=str(d["overruns"]))
         # colour the counters if anything is non-zero
@@ -824,13 +891,13 @@ class App(ctk.CTk):
         #  - rudder: 'tra' = target rudder angle. The rudder is an open-loop
         #            servo with no feedback, so this commanded value is the
         #            only rudder position the PCB reports.
-        sail = self.boat_view.sail_angle
-        rudder = self.boat_view.rudder_angle
+        sail = self.boat_act.sail_angle
+        rudder = self.boat_act.rudder_angle
         if "sa" in d:
             sail = ((d["sa"] - SAIL_CENTER_DEG + 180.0) % 360.0) - 180.0
         if "tra" in d:
             rudder = d["tra"]
-        self.boat_view.set_angles(sail, rudder)
+        self.boat_act.set_angles(sail, rudder)
 
         self.last_rx_time = datetime.now()
 
