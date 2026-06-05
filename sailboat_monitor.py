@@ -838,11 +838,10 @@ class App(ctk.CTk):
     def animate_commanded_sail(self):
         """Advance the commanded boat's sail at a constant slew rate.
 
-        Continuous-rotation model: a positive command spins the sail clockwise
-        (viewed from above), a negative command anti-clockwise, both at
-        SAIL_ROTATION_RATE_DPS. In BoatView's frame, positive angle = starboard,
-        so clockwise (toward port) means the angle decreases -> rate = -sign(cmd).
-        The rudder is positional and applied as-is.
+        Continuous-rotation model: the sail spins at SAIL_ROTATION_RATE_DPS while
+        the stick is deflected, with the direction matching the physical boat
+        (sign chosen below). Near-zero commands hold position. The rudder is
+        positional and applied as-is.
         """
         now = time.monotonic()
         if self._last_sail_tick is None:
@@ -851,7 +850,7 @@ class App(ctk.CTk):
         self._last_sail_tick = now
 
         if abs(self.cmd_sail_input) >= SAIL_CMD_DEADBAND:
-            direction = -1.0 if self.cmd_sail_input > 0 else 1.0
+            direction = 1.0 if self.cmd_sail_input > 0 else -1.0
             self.cmd_sail_angle += direction * SAIL_ROTATION_RATE_DPS * dt
             # wrap into [-180, 180)
             self.cmd_sail_angle = ((self.cmd_sail_angle + 180.0) % 360.0) - 180.0
