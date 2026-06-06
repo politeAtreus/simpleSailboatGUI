@@ -323,6 +323,8 @@ class BoatView(tk.Canvas):
                             width=2, smooth=True)
 
         # ---- mast + sail (pivots at hull centre) ----
+        # 0 deg = aft (the boom points toward the stern, straight down), as in
+        # the rest position. The angle increases as the sail rotates from there.
         mast_x, mast_y = cx, cy
         boom_len = L * 0.85
         tip = self._rotate(mast_x, mast_y + boom_len, mast_x, mast_y,
@@ -393,11 +395,6 @@ class SerialReader(threading.Thread):
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "460800"]
 MAX_LOG_LINES = 2000
 PORT_POLL_MS = 1500  # how often to scan for COM-port hot-plug / unplug
-
-# Encoder reading (telemetry 'sa') that corresponds to the sail being centred.
-# MUST match SAIL_CENTER_DEG in the boat firmware (motor_control.c) so the
-# drawn sail deflection lines up with the physical sail.
-SAIL_CENTER_DEG = 180.0
 
 # The sail is a continuous-rotation drive, not a positional servo: a negative
 # command spins it anti-clockwise (viewed from above), a positive command spins
@@ -852,8 +849,8 @@ class App(ctk.CTk):
         if abs(self.cmd_sail_input) >= SAIL_CMD_DEADBAND:
             direction = 1.0 if self.cmd_sail_input > 0 else -1.0
             self.cmd_sail_angle += direction * SAIL_ROTATION_RATE_DPS * dt
-            # wrap into [-180, 180)
-            self.cmd_sail_angle = ((self.cmd_sail_angle + 180.0) % 360.0) - 180.0
+            # wrap into [0, 360)
+            self.cmd_sail_angle %= 360.0
 
         self.boat_cmd.set_angles(self.cmd_sail_angle, self.cmd_rudder)
         self.after(50, self.animate_commanded_sail)
@@ -885,15 +882,15 @@ class App(ctk.CTk):
                                     text_color=("#1f1f1f", "#ffffff"))
 
         # Drive the boat schematic from the boat's *actual* reported angles:
-        #  - sail:   'sa' = AS5600 encoder (0-360), converted to deflection
-        #            about SAIL_CENTER_DEG and wrapped into [-180, 180).
+        #  - sail:   'sa' = AS5600 encoder angle, shown directly (0-360) so the
+        #            drawn value matches the 'sa' telemetry field. 0 deg = aft.
         #  - rudder: 'tra' = target rudder angle. The rudder is an open-loop
         #            servo with no feedback, so this commanded value is the
         #            only rudder position the PCB reports.
         sail = self.boat_act.sail_angle
         rudder = self.boat_act.rudder_angle
         if "sa" in d:
-            sail = ((d["sa"] - SAIL_CENTER_DEG + 180.0) % 360.0) - 180.0
+            sail = d["sa"] % 360.0
         if "tra" in d:
             rudder = d["tra"]
         self.boat_act.set_angles(sail, rudder)
