@@ -323,12 +323,14 @@ class BoatView(tk.Canvas):
                             width=2, smooth=True)
 
         # ---- mast + sail (pivots at hull centre) ----
-        # 0 deg = aft (the boom points toward the stern, straight down), as in
-        # the rest position. The angle increases as the sail rotates from there.
+        # 0 deg = bow (boom points forward, straight up). Increasing angle
+        # rotates clockwise (1,2,3...). The boom base point below is aft of the
+        # mast: '180 - angle' puts 0 at the bow and makes the sweep clockwise.
+        # Shared by both boat tiles.
         mast_x, mast_y = cx, cy
         boom_len = L * 0.85
         tip = self._rotate(mast_x, mast_y + boom_len, mast_x, mast_y,
-                           self.sail_angle)
+                           180.0 - self.sail_angle)
         self.create_line(mast_x, mast_y, tip[0], tip[1],
                         fill=self.SAIL_COLOR, width=7, capstyle="round")
         self.create_oval(mast_x - 5, mast_y - 5, mast_x + 5, mast_y + 5,
