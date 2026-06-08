@@ -138,8 +138,7 @@ see the error message instead of a window that silently never appears.)
    garbled characters, the baud is wrong.
 3. You'll see:
    - **Sail / Rudder gauges** — your joystick commands.
-   -   NOTE: Rudder in the "actual view" only changes when the rpi sends tra values in
-   -   autonomous operations, it is jot supposed to move from controller inputs
+     - **NOTE:** Rudder in the "actual view" only changes when the rpi sends tra values in autonomous operations, it is jot supposed to move from controller inputs
    - **Commanded** boat tile — where the sail *should* be (modeled).
    - **Actual** boat tile — where the boat *reports* the sail is (from telemetry).
    - **Sailboat Telemetry** panel — the full XBee data.
