@@ -395,8 +395,8 @@ class SerialReader(threading.Thread):
 # --------------------------------------------------------------------------- #
 
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "460800"]
-MAX_LOG_LINES = 2000
-PORT_POLL_MS = 1500  # how often to scan for COM-port hot-plug / unplug
+MAX_LOG_LINES = 20000
+PORT_POLL_MS = 1000  # how often to scan for COM-port hot-plug / unplug
 
 # The sail is a continuous-rotation drive, not a positional servo: a negative
 # command spins it anti-clockwise (viewed from above), a positive command spins
