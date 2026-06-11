@@ -33,12 +33,15 @@ Run:
     python sailboat_monitor.py
 """
 
+import csv
 import math
+import os
 import queue
 import re
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from datetime import datetime
 
 import customtkinter as ctk
@@ -555,6 +558,150 @@ class Boat3DView(tk.Canvas):
 
 
 # --------------------------------------------------------------------------- #
+# Wind rose + rolling trend plot (plain tkinter canvases)
+# --------------------------------------------------------------------------- #
+
+def _canvas_bg(master_frame):
+    """Resolve a canvas background that matches its parent CTk frame."""
+    try:
+        c = _resolve_color(master_frame.cget("fg_color"))
+    except Exception:
+        c = None
+    if not c or c == "transparent":
+        return "#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#dbdbdb"
+    return c
+
+
+class WindRose(tk.Canvas):
+    """Compass-style dial for the wind angle (wa), bow at the top.
+
+    wa is treated as degrees clockwise from the bow (0 = wind from dead ahead).
+    """
+
+    COLOR = "#5fd0a0"
+
+    def __init__(self, master, size=150, **kwargs):
+        super().__init__(master, width=size, height=size,
+                         highlightthickness=0, **kwargs)
+        self.master_frame = master
+        self.size = size
+        self.wind = 0.0
+        self.bind("<Configure>", lambda e: self._draw())
+        self.refresh_theme()
+
+    def set_wind(self, wa):
+        self.wind = float(wa) % 360.0
+        self._draw()
+
+    def refresh_theme(self):
+        self.configure(bg=_canvas_bg(self.master_frame))
+        self._draw()
+
+    def _palette(self):
+        if ctk.get_appearance_mode() == "Light":
+            return {"ring": "#9a9aa5", "tick": "#7a7a85", "label": "#55555f",
+                    "boat": "#5a5a66"}
+        return {"ring": "#54596a", "tick": "#6c6f80", "label": "#9a9aa5",
+                "boat": "#c8c8d4"}
+
+    def _draw(self):
+        self.delete("all")
+        pal = self._palette()
+        w = self.winfo_width() or self.size
+        h = self.winfo_height() or self.size
+        cx, cy = w / 2.0, h / 2.0 + 4
+        r = min(w, h) / 2.0 - 16
+
+        self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                        outline=pal["ring"], width=2)
+        # cardinal ticks
+        for ang in (0, 90, 180, 270):
+            a = math.radians(ang)
+            x1 = cx + (r - 6) * math.sin(a); y1 = cy - (r - 6) * math.cos(a)
+            x2 = cx + r * math.sin(a);       y2 = cy - r * math.cos(a)
+            self.create_line(x1, y1, x2, y2, fill=pal["tick"], width=1)
+        self.create_text(cx, cy - r - 7, text="BOW", fill=pal["label"],
+                        font=("TkDefaultFont", 8))
+
+        # boat indicator at centre (small triangle pointing to the bow / up)
+        self.create_polygon(cx, cy - 9, cx - 5, cy + 7, cx + 5, cy + 7,
+                           fill=pal["boat"], outline="")
+
+        # wind arrow: wind comes FROM bearing `wind` (clockwise from bow)
+        a = math.radians(self.wind)
+        fx = cx + r * math.sin(a); fy = cy - r * math.cos(a)
+        self.create_line(fx, fy, cx, cy, fill=self.COLOR, width=3,
+                        arrow="last", arrowshape=(10, 12, 5))
+        self.create_text(cx, cy + r + 8, text=f"Wind {self.wind:.0f}\u00b0",
+                        fill=self.COLOR, font=("TkDefaultFont", 10, "bold"))
+
+
+class TrendPlot(tk.Canvas):
+    """Rolling 0-360 deg time-series of wind angle, heading and sail angle."""
+
+    CHANNELS = [("wa", "Wind", "#5fd0a0"),
+                ("cb", "Heading", "#c08ae0"),
+                ("sa", "Sail", "#3b8ed0")]
+    MAXLEN = 150  # ~2.5 min at 1 Hz telemetry
+
+    def __init__(self, master, width=320, height=150, **kwargs):
+        super().__init__(master, width=width, height=height,
+                         highlightthickness=0, **kwargs)
+        self.master_frame = master
+        self.w, self.h = width, height
+        self.data = {k: deque(maxlen=self.MAXLEN) for k, _, _ in self.CHANNELS}
+        self.bind("<Configure>", lambda e: self._draw())
+        self.refresh_theme()
+
+    def add_sample(self, wa, cb, sa):
+        self.data["wa"].append(float(wa) % 360.0)
+        self.data["cb"].append(float(cb) % 360.0)
+        self.data["sa"].append(float(sa) % 360.0)
+        self._draw()
+
+    def refresh_theme(self):
+        self.configure(bg=_canvas_bg(self.master_frame))
+        self._draw()
+
+    def _palette(self):
+        if ctk.get_appearance_mode() == "Light":
+            return {"axis": "#9a9aa5", "grid": "#cfcfd6", "label": "#55555f"}
+        return {"axis": "#54596a", "grid": "#333642", "label": "#9a9aa5"}
+
+    def _draw(self):
+        self.delete("all")
+        pal = self._palette()
+        w = self.winfo_width() or self.w
+        h = self.winfo_height() or self.h
+        left, right, top, bot = 30, w - 8, 8, h - 6
+
+        for val in (0, 90, 180, 270, 360):
+            y = bot - (val / 360.0) * (bot - top)
+            self.create_line(left, y, right, y, fill=pal["grid"], width=1)
+            self.create_text(left - 4, y, text=str(val), anchor="e",
+                            fill=pal["label"], font=("TkDefaultFont", 7))
+        self.create_line(left, top, left, bot, fill=pal["axis"], width=1)
+        self.create_line(left, bot, right, bot, fill=pal["axis"], width=1)
+
+        n = len(self.data["wa"])
+        span = max(n - 1, 1)
+        legx = left + 6
+        for key, label, color in self.CHANNELS:
+            vals = list(self.data[key])
+            if len(vals) >= 2:
+                pts = []
+                for i, v in enumerate(vals):
+                    x = left + (i / span) * (right - left)
+                    y = bot - (v / 360.0) * (bot - top)
+                    pts.extend((x, y))
+                self.create_line(*pts, fill=color, width=2)
+            cur = f"{vals[-1]:.0f}\u00b0" if vals else "--"
+            self.create_text(legx, top + 6, text=f"{label} {cur}", anchor="w",
+                            fill=color, font=("TkDefaultFont", 8, "bold"))
+            legx += 82
+
+
+# --------------------------------------------------------------------------- #
 # Serial reader thread
 # --------------------------------------------------------------------------- #
 
@@ -635,10 +782,16 @@ class App(ctk.CTk):
         self.mapview = None
         self.boat_marker = None
         self.wp_marker = None
-        self.track_pts = []
+        self.gps_track = []          # [(lat, lon, datetime)] recorded always
+        # CSV recording
+        self.csv_file = None
+        self.csv_writer = None
+        self.csv_rows = 0
+        self.csv_path = None
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(1, weight=2)   # panels expand
+        self.grid_rowconfigure(2, weight=1, minsize=155)  # log always 5-6 lines
 
         self._build_connection_bar()
         self._build_panels()
@@ -701,9 +854,10 @@ class App(ctk.CTk):
     # ----- middle: controller + telemetry --------------------------------- #
     def _build_panels(self):
         wrap = ctk.CTkFrame(self, fg_color="transparent")
-        wrap.grid(row=1, column=0, sticky="ew", padx=12, pady=6)
+        wrap.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
         wrap.grid_columnconfigure(0, weight=1, uniform="cols")
         wrap.grid_columnconfigure(1, weight=1, uniform="cols")
+        wrap.grid_rowconfigure(0, weight=1)
 
         self._build_controller_card(wrap)
         self._build_telemetry_card(wrap)
@@ -795,14 +949,14 @@ class App(ctk.CTk):
         card.grid_columnconfigure(0, weight=1)
 
         head = ctk.CTkFrame(card, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
+        head.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 2))
         head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(head, text="Sailboat Telemetry (XBee RX)",
-                     font=ctk.CTkFont(size=16, weight="bold")).grid(
+                     font=ctk.CTkFont(size=13, weight="bold")).grid(
             row=0, column=0, sticky="w")
         self.rx_age_label = ctk.CTkLabel(head, text="no data",
                                          text_color="#888",
-                                         font=ctk.CTkFont(size=12))
+                                         font=ctk.CTkFont(size=11))
         self.rx_age_label.grid(row=0, column=1, sticky="e")
 
         row = 1
@@ -811,46 +965,100 @@ class App(ctk.CTk):
             if group != current_group:
                 current_group = group
                 ctk.CTkLabel(card, text=group,
-                             font=ctk.CTkFont(size=12, weight="bold"),
+                             font=ctk.CTkFont(size=10, weight="bold"),
                              text_color="#7a9fce").grid(
-                    row=row, column=0, sticky="w", padx=16, pady=(10, 2))
+                    row=row, column=0, sticky="w", padx=12, pady=(5, 1))
                 row += 1
             field = ctk.CTkFrame(card, fg_color="transparent")
-            field.grid(row=row, column=0, sticky="ew", padx=16, pady=1)
+            field.grid(row=row, column=0, sticky="ew", padx=12, pady=0)
             field.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(field, text=f"{label}  ({key})",
-                         font=ctk.CTkFont(size=13),
+                         font=ctk.CTkFont(size=11),
                          anchor="w").grid(row=0, column=0, sticky="w")
             val = ctk.CTkLabel(field, text="\u2014",
-                               font=ctk.CTkFont(size=15, weight="bold"),
+                               font=ctk.CTkFont(size=12, weight="bold"),
                                anchor="e")
             val.grid(row=0, column=1, sticky="e")
             self.telemetry_labels[key] = val
             row += 1
 
+        # Wind rose + rolling trend, filling the spare space below the fields.
+        extra = ctk.CTkFrame(card, fg_color="transparent")
+        extra.grid(row=row, column=0, sticky="nsew", padx=10, pady=(8, 10))
+        card.grid_rowconfigure(row, weight=1)
+        extra.grid_columnconfigure(0, weight=0)
+        extra.grid_columnconfigure(1, weight=1)
+        extra.grid_rowconfigure(0, weight=1)
+        self.wind_rose = WindRose(extra, size=220)
+        self.wind_rose.grid(row=0, column=0, sticky="ns", padx=(0, 10))
+        self.trend = TrendPlot(extra)
+        self.trend.grid(row=0, column=1, sticky="nsew")
+
     # ----- bottom: raw log ------------------------------------------------- #
     def _build_log(self):
-        card = ctk.CTkFrame(self, corner_radius=10)
-        card.grid(row=2, column=0, sticky="nsew", padx=12, pady=(6, 12))
-        card.grid_columnconfigure(0, weight=1)
-        card.grid_rowconfigure(1, weight=1)
+        self._log_collapsed = False
 
-        head = ctk.CTkFrame(card, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        self.log_card = ctk.CTkFrame(self, corner_radius=10)
+        self.log_card.grid(row=2, column=0, sticky="nsew", padx=12, pady=(6, 12))
+        self.log_card.grid_columnconfigure(0, weight=1)
+        self.log_card.grid_rowconfigure(1, weight=1)
+
+        head = ctk.CTkFrame(self.log_card, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 4))
         head.grid_columnconfigure(0, weight=1)
+
+        # collapse/expand button — far left so it's obviously a toggle
+        self.log_toggle_btn = ctk.CTkButton(
+            head, text="\u25bc", width=28, height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent", hover_color=("gray75", "gray30"),
+            command=self.toggle_log)
+        self.log_toggle_btn.grid(row=0, column=0, sticky="w", padx=(0, 6))
+
         ctk.CTkLabel(head, text="Raw Serial Log",
                      font=ctk.CTkFont(size=14, weight="bold")).grid(
-            row=0, column=0, sticky="w")
+            row=0, column=1, sticky="w")
+        head.grid_columnconfigure(1, weight=1)
+
         self.autoscroll = ctk.CTkCheckBox(head, text="Auto-scroll")
         self.autoscroll.select()
-        self.autoscroll.grid(row=0, column=1, padx=8)
+        self.autoscroll.grid(row=0, column=2, padx=8)
+        self.record_btn = ctk.CTkButton(head, text="\u25cf Record", width=92,
+                                        command=self.toggle_record)
+        self.record_btn.grid(row=0, column=3, padx=4)
+        self._rec_default_fg = self.record_btn.cget("fg_color")
+        self._rec_default_hover = self.record_btn.cget("hover_color")
+        self.export_btn = ctk.CTkButton(head, text="Export GPX", width=92,
+                                        command=self.export_gpx)
+        self.export_btn.grid(row=0, column=4, padx=4)
+        self.record_status = ctk.CTkLabel(head, text="not recording",
+                                          text_color=("gray45", "gray60"),
+                                          font=ctk.CTkFont(size=11))
+        self.record_status.grid(row=0, column=5, padx=(8, 8))
         ctk.CTkButton(head, text="Clear", width=80,
-                      command=self.clear_log).grid(row=0, column=2, padx=4)
+                      command=self.clear_log).grid(row=0, column=6, padx=4)
 
-        self.log = ctk.CTkTextbox(card, font=ctk.CTkFont(
+        self.log = ctk.CTkTextbox(self.log_card, font=ctk.CTkFont(
             family="Consolas", size=12))
         self.log.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
         self.log.configure(state="disabled")
+
+    def toggle_log(self):
+        """Collapse or expand the raw serial log body."""
+        self._log_collapsed = not self._log_collapsed
+        if self._log_collapsed:
+            # hide the textbox, shrink the row to just the header
+            self.log.grid_remove()
+            self.log_card.grid_rowconfigure(1, weight=0, minsize=0)
+            self.grid_rowconfigure(2, weight=0, minsize=0)
+            self.log_toggle_btn.configure(text="\u25b2")
+        else:
+            # restore
+            self.log.grid()
+            self.log_card.grid_rowconfigure(1, weight=1)
+            self.grid_rowconfigure(2, weight=1, minsize=155)
+            self.log_toggle_btn.configure(text="\u25bc")
+
 
     # ----- port handling --------------------------------------------------- #
     def refresh_ports(self):
@@ -885,6 +1093,8 @@ class App(ctk.CTk):
         self.rudder_bar.refresh_theme()
         self.boat_cmd.refresh_theme()
         self.boat_act.refresh_theme()
+        self.wind_rose.refresh_theme()
+        self.trend.refresh_theme()
         if self.view3d is not None:
             self.view3d.refresh_theme()
 
@@ -944,6 +1154,11 @@ class App(ctk.CTk):
         # Seed with the latest known state
         self._refresh_3d_from_latest()
 
+        # CTkToplevel applies its title bar / icon on a short timer, which can
+        # re-stack the new window behind its parent. Raise it just after that.
+        self.win3d.after(250, self.win3d.lift)
+        self.win3d.after(260, self.win3d.focus)
+
     def _close_3d_window(self):
         if self.win3d is not None:
             self.win3d.destroy()
@@ -962,7 +1177,7 @@ class App(ctk.CTk):
                               self.boat_act.rudder_angle)
 
     def update_3d_and_map(self, d):
-        """Feed a telemetry dict into the 3D boat and the GPS map (if open)."""
+        """Feed the latest state into the 3D boat and the GPS map (if open)."""
         self._last_heading = d.get("cb", getattr(self, "_last_heading", 0.0))
         if self.view3d is not None:
             self.view3d.set_state(self._last_heading,
@@ -970,36 +1185,114 @@ class App(ctk.CTk):
                                   self.boat_act.rudder_angle)
         if self.mapview is None:
             return
-        lat = d.get("clat")
-        lon = d.get("clon")
-        # Treat (0, 0) / missing as "no fix" so we don't fly off to the ocean.
-        if lat is not None and lon is not None and (abs(lat) > 1e-4 or abs(lon) > 1e-4):
-            if self.boat_marker is None:
-                self.boat_marker = self.mapview.set_marker(lat, lon, text="Boat")
-                self.mapview.set_position(lat, lon)
-            else:
-                self.boat_marker.set_position(lat, lon)
-            # build a breadcrumb track
-            if not self.track_pts or (self.track_pts[-1] != (lat, lon)):
-                self.track_pts.append((lat, lon))
-                if len(self.track_pts) > 1:
-                    try:
-                        self.mapview.delete_all_path()
-                    except Exception:
-                        pass
-                    self.mapview.set_path(self.track_pts[-500:])
-        # waypoint marker
-        tlat = d.get("tlat")
-        tlon = d.get("tlon")
-        if tlat is not None and tlon is not None and (abs(tlat) > 1e-4 or abs(tlon) > 1e-4):
-            if self.wp_marker is None:
-                self.wp_marker = self.mapview.set_marker(tlat, tlon,
-                                                         text="Waypoint")
-            else:
-                self.wp_marker.set_position(tlat, tlon)
+        try:
+            if self.gps_track:
+                lat, lon, _ = self.gps_track[-1]
+                if self.boat_marker is None:
+                    self.boat_marker = self.mapview.set_marker(lat, lon,
+                                                               text="Boat")
+                    self.mapview.set_position(lat, lon)
+                else:
+                    self.boat_marker.set_position(lat, lon)
+                coords = [(p[0], p[1]) for p in self.gps_track[-500:]]
+                if len(coords) > 1:
+                    self.mapview.delete_all_path()
+                    self.mapview.set_path(coords)
+            tlat = d.get("tlat")
+            tlon = d.get("tlon")
+            if (tlat is not None and tlon is not None
+                    and (abs(tlat) > 1e-4 or abs(tlon) > 1e-4)):
+                if self.wp_marker is None:
+                    self.wp_marker = self.mapview.set_marker(tlat, tlon,
+                                                             text="Waypoint")
+                else:
+                    self.wp_marker.set_position(tlat, tlon)
+        except Exception:
+            pass  # window may be tearing down as a packet lands
 
+    # ----- recording: CSV + GPX ------------------------------------------- #
+    def toggle_record(self):
+        if self.csv_file is None:
+            self.start_recording()
+        else:
+            self.stop_recording()
 
-    # ----- COM-port hot-plug watcher -------------------------------------- #
+    def start_recording(self):
+        try:
+            os.makedirs("logs", exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.csv_path = os.path.join("logs", f"telemetry_{stamp}.csv")
+            self.csv_file = open(self.csv_path, "w", newline="")
+        except OSError as e:
+            self.append_log(f"** Could not start recording: {e} **")
+            self.csv_file = None
+            return
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(["timestamp"] +
+                                 [k for k, _, _ in TELEMETRY_FIELDS])
+        self.csv_rows = 0
+        self.record_btn.configure(text="\u25a0 Stop", fg_color="#c0552e",
+                                  hover_color="#a8482a")
+        self.append_log(f"** Recording to {self.csv_path} **")
+        self._update_record_status()
+
+    def stop_recording(self):
+        if self.csv_file is not None:
+            try:
+                self.csv_file.close()
+            except Exception:
+                pass
+        self.append_log(f"** Recording stopped: {self.csv_path} "
+                        f"({self.csv_rows} rows) **")
+        self.csv_file = None
+        self.csv_writer = None
+        self.record_btn.configure(text="\u25cf Record",
+                                  fg_color=self._rec_default_fg,
+                                  hover_color=self._rec_default_hover)
+        self._update_record_status()
+
+    def _record_row(self, d):
+        if self.csv_writer is None:
+            return
+        row = [datetime.now().isoformat(timespec="milliseconds")]
+        row += [d.get(k, "") for k, _, _ in TELEMETRY_FIELDS]
+        try:
+            self.csv_writer.writerow(row)
+            self.csv_rows += 1
+            self._update_record_status()
+        except Exception:
+            pass
+
+    def _update_record_status(self):
+        if self.csv_file is not None:
+            self.record_status.configure(
+                text=f"\u25cf REC  {self.csv_rows} rows", text_color="#d05b5b")
+        else:
+            self.record_status.configure(text="not recording",
+                                         text_color=("gray45", "gray60"))
+
+    def export_gpx(self):
+        if not self.gps_track:
+            self.append_log("** No GPS points to export yet. **")
+            return
+        try:
+            os.makedirs("logs", exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join("logs", f"track_{stamp}.gpx")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+                f.write('<gpx version="1.1" creator="Sailboat Ground Station '
+                        'Monitor" xmlns="http://www.topografix.com/GPX/1/1">\n')
+                f.write(' <trk><name>Sailboat track</name><trkseg>\n')
+                for lat, lon, t in self.gps_track:
+                    f.write(f'  <trkpt lat="{lat:.7f}" lon="{lon:.7f}">'
+                            f'<time>{t.isoformat()}</time></trkpt>\n')
+                f.write(' </trkseg></trk>\n</gpx>\n')
+            self.append_log(f"** Exported {len(self.gps_track)} points to "
+                            f"{path} **")
+        except OSError as e:
+            self.append_log(f"** GPX export failed: {e} **")
+
     def watch_ports(self):
         """Periodically scan COM ports; auto-connect to a new ST-Link.
 
@@ -1217,8 +1510,26 @@ class App(ctk.CTk):
             rudder = d["tra"]
         self.boat_act.set_angles(sail, rudder)
 
+        # GPS breadcrumb track (used by the map and GPX export). Append before
+        # the map update so it can read the newest point. Skip (0,0)/no-fix and
+        # duplicate consecutive points.
+        lat, lon = d.get("clat"), d.get("clon")
+        if (lat is not None and lon is not None
+                and (abs(lat) > 1e-4 or abs(lon) > 1e-4)):
+            if not self.gps_track or self.gps_track[-1][:2] != (lat, lon):
+                self.gps_track.append((lat, lon, datetime.now()))
+
         # Feed the pseudo-3D boat (heading/sail/rudder) and the GPS map.
         self.update_3d_and_map(d)
+
+        # Wind compass rose + rolling trend plot.
+        if "wa" in d:
+            self.wind_rose.set_wind(d["wa"])
+        self.trend.add_sample(d.get("wa", 0.0), d.get("cb", 0.0),
+                              d.get("sa", 0.0))
+
+        # CSV recording (no-op unless recording is active).
+        self._record_row(d)
 
         self.last_rx_time = datetime.now()
 
@@ -1253,6 +1564,8 @@ class App(ctk.CTk):
 
     # ----- shutdown -------------------------------------------------------- #
     def on_close(self):
+        if self.csv_file is not None:
+            self.stop_recording()
         self.disconnect()
         self.destroy()
 
