@@ -855,8 +855,8 @@ class App(ctk.CTk):
     def _build_panels(self):
         wrap = ctk.CTkFrame(self, fg_color="transparent")
         wrap.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
-        wrap.grid_columnconfigure(0, weight=1, uniform="cols")
-        wrap.grid_columnconfigure(1, weight=1, uniform="cols")
+        wrap.grid_columnconfigure(0, weight=2, uniform="cols")
+        wrap.grid_columnconfigure(1, weight=3, uniform="cols")
         wrap.grid_rowconfigure(0, weight=1)
 
         self._build_controller_card(wrap)
@@ -960,37 +960,58 @@ class App(ctk.CTk):
         self.rx_age_label.grid(row=0, column=1, sticky="e")
 
         row = 1
-        current_group = None
+        # Two sub-columns: Target/Setpoints on the left, Boat State on the right.
+        # This halves the vertical height used by the field list.
+        cols_frame = ctk.CTkFrame(card, fg_color="transparent")
+        cols_frame.grid(row=row, column=0, sticky="ew", padx=6, pady=(2, 0))
+        cols_frame.grid_columnconfigure(0, weight=1, uniform="tcols")
+        cols_frame.grid_columnconfigure(1, weight=0)   # divider
+        cols_frame.grid_columnconfigure(2, weight=1, uniform="tcols")
+
+        from collections import OrderedDict
+        groups = OrderedDict()
         for key, label, group in TELEMETRY_FIELDS:
-            if group != current_group:
-                current_group = group
-                ctk.CTkLabel(card, text=group,
-                             font=ctk.CTkFont(size=10, weight="bold"),
-                             text_color="#7a9fce").grid(
-                    row=row, column=0, sticky="w", padx=12, pady=(5, 1))
-                row += 1
-            field = ctk.CTkFrame(card, fg_color="transparent")
-            field.grid(row=row, column=0, sticky="ew", padx=12, pady=0)
-            field.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(field, text=f"{label}  ({key})",
-                         font=ctk.CTkFont(size=11),
-                         anchor="w").grid(row=0, column=0, sticky="w")
-            val = ctk.CTkLabel(field, text="\u2014",
-                               font=ctk.CTkFont(size=12, weight="bold"),
-                               anchor="e")
-            val.grid(row=0, column=1, sticky="e")
-            self.telemetry_labels[key] = val
-            row += 1
+            groups.setdefault(group, []).append((key, label))
+
+        # vertical divider
+        div = tk.Frame(cols_frame, width=1,
+                       bg="#3a3a4a" if ctk.get_appearance_mode() == "Dark"
+                       else "#c0c0cc")
+        div.grid(row=0, column=1, sticky="ns", padx=6)
+
+        for col_idx, (group_name, fields) in enumerate(groups.items()):
+            grid_col = 0 if col_idx == 0 else 2   # skip the divider column
+            grp = ctk.CTkFrame(cols_frame, fg_color="transparent")
+            grp.grid(row=0, column=grid_col, sticky="nsew", padx=(6, 6))
+            grp.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(grp, text=group_name,
+                         font=ctk.CTkFont(size=10, weight="bold"),
+                         text_color="#7a9fce").grid(
+                row=0, column=0, columnspan=2, sticky="w", pady=(4, 2))
+            for f_idx, (key, label) in enumerate(fields):
+                frow = ctk.CTkFrame(grp, fg_color="transparent")
+                frow.grid(row=f_idx + 1, column=0, sticky="ew", pady=0)
+                frow.grid_columnconfigure(0, weight=1)
+                ctk.CTkLabel(frow, text=f"{label}  ({key})",
+                             font=ctk.CTkFont(size=11),
+                             anchor="w").grid(row=0, column=0, sticky="w")
+                val = ctk.CTkLabel(frow, text="\u2014",
+                                   font=ctk.CTkFont(size=12, weight="bold"),
+                                   anchor="e")
+                val.grid(row=0, column=1, sticky="e")
+                self.telemetry_labels[key] = val
+
+        row += 1
 
         # Wind rose + rolling trend, filling the spare space below the fields.
         extra = ctk.CTkFrame(card, fg_color="transparent")
         extra.grid(row=row, column=0, sticky="nsew", padx=10, pady=(8, 10))
         card.grid_rowconfigure(row, weight=1)
-        extra.grid_columnconfigure(0, weight=0)
+        extra.grid_columnconfigure(0, weight=1)
         extra.grid_columnconfigure(1, weight=1)
         extra.grid_rowconfigure(0, weight=1)
         self.wind_rose = WindRose(extra, size=220)
-        self.wind_rose.grid(row=0, column=0, sticky="ns", padx=(0, 10))
+        self.wind_rose.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self.trend = TrendPlot(extra)
         self.trend.grid(row=0, column=1, sticky="nsew")
 
