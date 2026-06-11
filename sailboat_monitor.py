@@ -359,6 +359,202 @@ class BoatView(tk.Canvas):
 
 
 # --------------------------------------------------------------------------- #
+# Pseudo-3D boat view (orthographic projection on a plain tkinter Canvas)
+# --------------------------------------------------------------------------- #
+
+def _rot_z(p, deg):
+    """Yaw a 3D point about the vertical (z) axis through the origin."""
+    a = math.radians(deg)
+    x, y, z = p
+    return (x * math.cos(a) - y * math.sin(a),
+            x * math.sin(a) + y * math.cos(a), z)
+
+
+def _rot_z_about(p, deg, ox, oy):
+    """Yaw a 3D point about a vertical axis through (ox, oy)."""
+    a = math.radians(deg)
+    x, y, z = p
+    dx, dy = x - ox, y - oy
+    return (ox + dx * math.cos(a) - dy * math.sin(a),
+            oy + dx * math.sin(a) + dy * math.cos(a), z)
+
+
+class Boat3DView(tk.Canvas):
+    """Lightweight 3/4-view of the boat: hull, keel, mast/sail and rudder.
+
+    No 3D engine -- points are rotated for the boat's heading and the camera,
+    then orthographically projected and drawn back-to-front (painter's order).
+    Driven by heading (cb), sail angle (sa) and rudder angle (tra).
+    """
+
+    SAIL_COLOR = "#3b8ed0"
+    RUDDER_COLOR = "#e8a33d"
+    AZ = 35.0   # camera azimuth (deg)
+    EL = 26.0   # camera elevation (deg)
+
+    def __init__(self, master, width=460, height=460, **kwargs):
+        super().__init__(master, width=width, height=height,
+                         highlightthickness=0, **kwargs)
+        self.master_frame = master
+        self.w, self.h = width, height
+        self.heading = 0.0
+        self.sail_angle = 0.0
+        self.rudder_angle = 0.0
+        self.bind("<Configure>", lambda e: self._draw())
+        self.refresh_theme()
+
+    def set_state(self, heading, sail, rudder):
+        self.heading = float(heading)
+        self.sail_angle = float(sail)
+        self.rudder_angle = float(rudder)
+        self._draw()
+
+    def refresh_theme(self):
+        self.configure(bg=self._bg_color())
+        self._draw()
+
+    def _bg_color(self):
+        try:
+            c = _resolve_color(self.master_frame.cget("fg_color"))
+        except Exception:
+            c = None
+        if not c or c == "transparent":
+            return "#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#dbdbdb"
+        return c
+
+    def _palette(self):
+        if ctk.get_appearance_mode() == "Light":
+            return {"water": "#b9c4cf", "deck": "#c8ccd4", "hull": "#aeb3bd",
+                    "hull_dark": "#9398a3", "keel": "#6f7480", "mast": "#5a5a66",
+                    "label": "#55555f", "outline": "#5a5a66"}
+        return {"water": "#2f3a44", "deck": "#54596a", "hull": "#454a5b",
+                "hull_dark": "#363a48", "keel": "#2b2e3a", "mast": "#c8c8d4",
+                "label": "#9a9aa5", "outline": "#1c1c24"}
+
+    def _project(self, p, scale, cx, cy):
+        x, y, z = p
+        az = math.radians(self.AZ)
+        el = math.radians(self.EL)
+        x1 = x * math.cos(az) - y * math.sin(az)
+        y1 = x * math.sin(az) + y * math.cos(az)
+        up = z * math.cos(el) - y1 * math.sin(el)        # screen vertical (+up)
+        depth = z * math.sin(el) + y1 * math.cos(el)     # into-screen distance
+        return (cx + scale * x1, cy - scale * up, depth)
+
+    def _draw(self):
+        self.delete("all")
+        pal = self._palette()
+        w = self.winfo_width() or self.w
+        h = self.winfo_height() or self.h
+        cx, cy = w / 2.0, h * 0.60
+        scale = min(w, h) * 0.135   # smaller so the tall wing sail fits
+
+        def P(p):
+            return self._project(p, scale, cx, cy)
+
+        # ---- water grid (world plane z=0) ----
+        g = 3.0
+        step = 0.6
+        n = int(g / step)
+        for i in range(-n, n + 1):
+            a = P((i * step, -g, 0));  b = P((i * step, g, 0))
+            self.create_line(a[0], a[1], b[0], b[1], fill=pal["water"], width=1)
+            a = P((-g, i * step, 0));  b = P((g, i * step, 0))
+            self.create_line(a[0], a[1], b[0], b[1], fill=pal["water"], width=1)
+
+        # ---- build boat geometry in boat frame (y=fwd/bow, x=stbd, z=up) ----
+        # Long, slender monohull (see reference photos).
+        deck_z, bot_z = 0.16, -0.22
+        top = [(0, 1.85, deck_z), (0.20, 1.05, deck_z), (0.30, 0.0, deck_z),
+               (0.26, -1.05, deck_z), (0.15, -1.6, deck_z),
+               (-0.15, -1.6, deck_z), (-0.26, -1.05, deck_z),
+               (-0.30, 0.0, deck_z), (-0.20, 1.05, deck_z)]
+        bot = [(0, 1.7, bot_z), (0.10, 1.05, bot_z), (0.15, 0.0, bot_z),
+               (0.13, -1.05, bot_z), (0.07, -1.5, bot_z),
+               (-0.07, -1.5, bot_z), (-0.13, -1.05, bot_z),
+               (-0.15, 0.0, bot_z), (-0.10, 1.05, bot_z)]
+
+        faces = []  # (list_of_3d_pts, fill, outline)
+        # hull side panels
+        m = len(top)
+        for i in range(m):
+            j = (i + 1) % m
+            faces.append(([top[i], top[j], bot[j], bot[i]],
+                          pal["hull"], pal["outline"]))
+        # deck (top) and hull bottom
+        faces.append((list(top), pal["deck"], pal["outline"]))
+        faces.append((list(bot), pal["hull_dark"], pal["outline"]))
+
+        # deep fin keel (vertical, x=0 plane, roughly amidships, hangs well down)
+        keel_y, keel_depth = 0.05, -1.85
+        keel = [(0, keel_y + 0.32, bot_z), (0, keel_y - 0.34, bot_z),
+                (0, keel_y - 0.10, keel_depth), (0, keel_y + 0.10, keel_depth)]
+        faces.append((keel, pal["keel"], pal["keel"]))
+
+        # rudder (shorter fin at the stern; yaws with the rudder angle)
+        rpx, rpy = 0.0, -1.50
+        rud = [(0, -1.44, -0.16), (0, -1.60, -0.16),
+               (0, -1.54, -0.92), (0, -1.38, -0.92)]
+        rud = [_rot_z_about(p, self.rudder_angle, rpx, rpy) for p in rud]
+        faces.append((rud, self.RUDDER_COLOR, self.RUDDER_COLOR))
+
+        # wind-sensor pole near the bow (short black pole + sensor head)
+        wp_x, wp_y = 0.0, 0.95
+        sens_base = (wp_x, wp_y, deck_z)
+        sens_top = (wp_x, wp_y, deck_z + 0.55)
+
+        # rigid WING SAIL: a tall rectangular panel that pivots about the mast.
+        # 0 deg = bow, clockwise positive; the chord swings with the sail angle.
+        mast_y = 0.0
+        chord = 0.62
+        wing_top = 2.7
+        th = math.radians(self.sail_angle)
+        dx, dy = math.sin(th), math.cos(th)         # chord (trailing) direction
+        le_b = (0, mast_y, deck_z)                  # leading edge, bottom
+        le_t = (0, mast_y, wing_top)                # leading edge, top
+        te_t = (chord * dx, mast_y + chord * dy, wing_top)
+        te_b = (chord * dx, mast_y + chord * dy, deck_z)
+        faces.append(([le_b, le_t, te_t, te_b], self.SAIL_COLOR, "#1c2e3c"))
+
+        # ---- apply heading yaw, project, sort back-to-front, draw ----
+        def H(p):
+            return _rot_z(p, -self.heading)
+
+        drawn = []
+        for pts3d, fill, outline in faces:
+            proj = [P(H(p)) for p in pts3d]
+            depth = sum(q[2] for q in proj) / len(proj)
+            flat = []
+            for q in proj:
+                flat.extend((q[0], q[1]))
+            drawn.append((depth, flat, fill, outline))
+        # draw farthest first (largest depth)
+        drawn.sort(key=lambda t: t[0], reverse=True)
+        for _depth, flat, fill, outline in drawn:
+            self.create_polygon(flat, fill=fill, outline=outline, width=1)
+
+        # mast (wing leading edge) on top, plus the bow wind-sensor pole
+        a = P(H(le_b)); b = P(H(le_t))
+        self.create_line(a[0], a[1], b[0], b[1], fill=pal["mast"], width=3)
+        a = P(H(sens_base)); b = P(H(sens_top))
+        self.create_line(a[0], a[1], b[0], b[1], fill=pal["mast"], width=2)
+        self.create_oval(b[0] - 4, b[1] - 4, b[0] + 4, b[1] + 4,
+                        fill=pal["deck"], outline=pal["mast"])
+
+        # ---- captions ----
+        self.create_text(12, 14, anchor="nw",
+                        text=f"Heading {self.heading:.0f}\u00b0",
+                        fill=pal["label"], font=("TkDefaultFont", 10, "bold"))
+        self.create_text(12, 32, anchor="nw",
+                        text=f"Sail {self.sail_angle:.0f}\u00b0",
+                        fill=self.SAIL_COLOR, font=("TkDefaultFont", 10, "bold"))
+        self.create_text(12, 50, anchor="nw",
+                        text=f"Rudder {self.rudder_angle:.0f}\u00b0",
+                        fill=self.RUDDER_COLOR,
+                        font=("TkDefaultFont", 10, "bold"))
+
+
+# --------------------------------------------------------------------------- #
 # Serial reader thread
 # --------------------------------------------------------------------------- #
 
@@ -395,8 +591,8 @@ class SerialReader(threading.Thread):
 # --------------------------------------------------------------------------- #
 
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "460800"]
-MAX_LOG_LINES = 20000
-PORT_POLL_MS = 1000  # how often to scan for COM-port hot-plug / unplug
+MAX_LOG_LINES = 2000
+PORT_POLL_MS = 1500  # how often to scan for COM-port hot-plug / unplug
 
 # The sail is a continuous-rotation drive, not a positional servo: a negative
 # command spins it anti-clockwise (viewed from above), a positive command spins
@@ -433,6 +629,13 @@ class App(ctk.CTk):
         self.cmd_sail_angle = 0.0    # integrated displayed sail angle
         self.cmd_rudder = 0.0        # latest rudder command (positional)
         self._last_sail_tick = None  # time.monotonic() of last animation frame
+        # 3D + GPS map window (created on demand)
+        self.win3d = None
+        self.view3d = None
+        self.mapview = None
+        self.boat_marker = None
+        self.wp_marker = None
+        self.track_pts = []
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
@@ -482,8 +685,12 @@ class App(ctk.CTk):
         self.autoconnect = ctk.CTkCheckBox(
             bar, text="Auto-connect when an ST-Link COM port is plugged in")
         self.autoconnect.select()
-        self.autoconnect.grid(row=1, column=0, columnspan=6, padx=12,
+        self.autoconnect.grid(row=1, column=0, columnspan=5, padx=12,
                               pady=(0, 10), sticky="w")
+
+        self.view3d_btn = ctk.CTkButton(
+            bar, text="3D View & Map", width=130, command=self.open_3d_window)
+        self.view3d_btn.grid(row=1, column=5, padx=6, pady=(0, 10), sticky="e")
 
         self.dark_switch = ctk.CTkSwitch(
             bar, text="Dark Mode", command=self.toggle_appearance)
@@ -678,6 +885,119 @@ class App(ctk.CTk):
         self.rudder_bar.refresh_theme()
         self.boat_cmd.refresh_theme()
         self.boat_act.refresh_theme()
+        if self.view3d is not None:
+            self.view3d.refresh_theme()
+
+    # ----- 3D view + GPS map window --------------------------------------- #
+    def open_3d_window(self):
+        """Open (or focus) the pseudo-3D boat + GPS map window."""
+        if self.win3d is not None and self.win3d.winfo_exists():
+            self.win3d.focus()
+            return
+
+        try:
+            import tkintermapview
+        except ImportError:
+            self.append_log("** 'tkintermapview' is not installed. Run: "
+                            "pip install tkintermapview **")
+            tkintermapview = None
+
+        self.win3d = ctk.CTkToplevel(self)
+        self.win3d.title("3D View & GPS Map")
+        self.win3d.geometry("1000x540")
+        self.win3d.grid_columnconfigure(0, weight=1, uniform="v3")
+        self.win3d.grid_columnconfigure(1, weight=1, uniform="v3")
+        self.win3d.grid_rowconfigure(0, weight=1)
+        self.win3d.protocol("WM_DELETE_WINDOW", self._close_3d_window)
+
+        # Left: pseudo-3D boat
+        left = ctk.CTkFrame(self.win3d, corner_radius=10)
+        left.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(left, text="Boat (3D)",
+                     font=ctk.CTkFont(size=15, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=14, pady=(12, 4))
+        self.view3d = Boat3DView(left)
+        self.view3d.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 12))
+
+        # Right: GPS map
+        right = ctk.CTkFrame(self.win3d, corner_radius=10)
+        right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(right, text="Position (GPS)",
+                     font=ctk.CTkFont(size=15, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=14, pady=(12, 4))
+        if tkintermapview is not None:
+            self.mapview = tkintermapview.TkinterMapView(right, corner_radius=8)
+            self.mapview.grid(row=1, column=0, sticky="nsew", padx=10,
+                             pady=(0, 12))
+            self.mapview.set_zoom(15)
+        else:
+            ctk.CTkLabel(right, text="Map unavailable.\nInstall it with:\n"
+                         "pip install tkintermapview",
+                         justify="center").grid(row=1, column=0, padx=20,
+                                                pady=20)
+            self.mapview = None
+
+        # Seed with the latest known state
+        self._refresh_3d_from_latest()
+
+    def _close_3d_window(self):
+        if self.win3d is not None:
+            self.win3d.destroy()
+        self.win3d = None
+        self.view3d = None
+        self.mapview = None
+        self.boat_marker = None
+        self.wp_marker = None
+
+    def _refresh_3d_from_latest(self):
+        """Push the most recent telemetry into the 3D view."""
+        if self.view3d is None:
+            return
+        self.view3d.set_state(getattr(self, "_last_heading", 0.0),
+                              self.boat_act.sail_angle,
+                              self.boat_act.rudder_angle)
+
+    def update_3d_and_map(self, d):
+        """Feed a telemetry dict into the 3D boat and the GPS map (if open)."""
+        self._last_heading = d.get("cb", getattr(self, "_last_heading", 0.0))
+        if self.view3d is not None:
+            self.view3d.set_state(self._last_heading,
+                                  self.boat_act.sail_angle,
+                                  self.boat_act.rudder_angle)
+        if self.mapview is None:
+            return
+        lat = d.get("clat")
+        lon = d.get("clon")
+        # Treat (0, 0) / missing as "no fix" so we don't fly off to the ocean.
+        if lat is not None and lon is not None and (abs(lat) > 1e-4 or abs(lon) > 1e-4):
+            if self.boat_marker is None:
+                self.boat_marker = self.mapview.set_marker(lat, lon, text="Boat")
+                self.mapview.set_position(lat, lon)
+            else:
+                self.boat_marker.set_position(lat, lon)
+            # build a breadcrumb track
+            if not self.track_pts or (self.track_pts[-1] != (lat, lon)):
+                self.track_pts.append((lat, lon))
+                if len(self.track_pts) > 1:
+                    try:
+                        self.mapview.delete_all_path()
+                    except Exception:
+                        pass
+                    self.mapview.set_path(self.track_pts[-500:])
+        # waypoint marker
+        tlat = d.get("tlat")
+        tlon = d.get("tlon")
+        if tlat is not None and tlon is not None and (abs(tlat) > 1e-4 or abs(tlon) > 1e-4):
+            if self.wp_marker is None:
+                self.wp_marker = self.mapview.set_marker(tlat, tlon,
+                                                         text="Waypoint")
+            else:
+                self.wp_marker.set_position(tlat, tlon)
+
 
     # ----- COM-port hot-plug watcher -------------------------------------- #
     def watch_ports(self):
@@ -896,6 +1216,9 @@ class App(ctk.CTk):
         if "tra" in d:
             rudder = d["tra"]
         self.boat_act.set_angles(sail, rudder)
+
+        # Feed the pseudo-3D boat (heading/sail/rudder) and the GPS map.
+        self.update_3d_and_map(d)
 
         self.last_rx_time = datetime.now()
 
