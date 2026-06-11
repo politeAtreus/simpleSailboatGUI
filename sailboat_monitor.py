@@ -392,8 +392,8 @@ class Boat3DView(tk.Canvas):
 
     SAIL_COLOR = "#3b8ed0"
     RUDDER_COLOR = "#e8a33d"
-    AZ = 35.0   # camera azimuth (deg)
-    EL = 26.0   # camera elevation (deg)
+    AZ = 215.0  # camera azimuth: negative puts the bow toward screen upper-right
+    EL = 26.0   # camera elevation
 
     def __init__(self, master, width=460, height=460, **kwargs):
         super().__init__(master, width=width, height=height,
@@ -738,8 +738,8 @@ class SerialReader(threading.Thread):
 # --------------------------------------------------------------------------- #
 
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "460800"]
-MAX_LOG_LINES = 2000
-PORT_POLL_MS = 1500  # how often to scan for COM-port hot-plug / unplug
+MAX_LOG_LINES = 200000
+PORT_POLL_MS = 1000  # how often to scan for COM-port hot-plug / unplug
 
 # The sail is a continuous-rotation drive, not a positional servo: a negative
 # command spins it anti-clockwise (viewed from above), a positive command spins
@@ -790,8 +790,7 @@ class App(ctk.CTk):
         self.csv_path = None
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=2)   # panels expand
-        self.grid_rowconfigure(2, weight=1, minsize=155)  # log always 5-6 lines
+        self.grid_rowconfigure(1, weight=1)   # single weighted row: the outer pane
 
         self._build_connection_bar()
         self._build_panels()
@@ -853,14 +852,44 @@ class App(ctk.CTk):
 
     # ----- middle: controller + telemetry --------------------------------- #
     def _build_panels(self):
-        wrap = ctk.CTkFrame(self, fg_color="transparent")
-        wrap.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
-        wrap.grid_columnconfigure(0, weight=2, uniform="cols")
-        wrap.grid_columnconfigure(1, weight=3, uniform="cols")
-        wrap.grid_rowconfigure(0, weight=1)
+        dark = ctk.get_appearance_mode() == "Dark"
+        sash_bg = "#1c1c24" if dark else "#d0d0d8"
+        sash_kw = dict(sashwidth=6, sashpad=2, sashrelief="flat",
+                       bg=sash_bg, bd=0)
 
-        self._build_controller_card(wrap)
-        self._build_telemetry_card(wrap)
+        # Outer vertical pane: top = controller+telemetry, bottom = log.
+        self.vpane = tk.PanedWindow(self, orient=tk.VERTICAL,
+                                    sashcursor="sb_v_double_arrow", **sash_kw)
+        self.vpane.grid(row=1, column=0, sticky="nsew", padx=12, pady=(6, 6))
+
+        # Inner horizontal pane: left = controller, right = telemetry.
+        panels_bg = tk.Frame(self.vpane, bg=sash_bg)
+        self.hpane = tk.PanedWindow(panels_bg, orient=tk.HORIZONTAL,
+                                    sashcursor="sb_h_double_arrow", **sash_kw)
+        self.hpane.pack(fill=tk.BOTH, expand=True)
+
+        ctrl_wrap = tk.Frame(self.hpane, bg=sash_bg)
+        ctrl_wrap.grid_columnconfigure(0, weight=1)
+        ctrl_wrap.grid_rowconfigure(0, weight=1)
+        self._build_controller_card(ctrl_wrap)
+        self.hpane.add(ctrl_wrap, minsize=300, stretch="always")
+
+        telem_wrap = tk.Frame(self.hpane, bg=sash_bg)
+        telem_wrap.grid_columnconfigure(0, weight=1)
+        telem_wrap.grid_rowconfigure(0, weight=1)
+        self._build_telemetry_card(telem_wrap)
+        self.hpane.add(telem_wrap, minsize=350, stretch="always")
+
+        self.vpane.add(panels_bg, minsize=280, stretch="always")
+
+        # Set initial sash positions after the window geometry is finalised.
+        # Horizontal: 2:5 controller, 3:5 telemetry (same as previous weights).
+        # Vertical: ~72% panels, 28% log.
+        def _place_sashes():
+            hw = self.hpane.winfo_width()
+            if hw > 1:
+                self.hpane.sash_place(0, int(hw * 0.40), 0)
+        self.vpane.after(80, _place_sashes)
 
     def _build_controller_card(self, parent):
         card = ctk.CTkFrame(parent, corner_radius=10)
@@ -945,7 +974,7 @@ class App(ctk.CTk):
 
     def _build_telemetry_card(self, parent):
         card = ctk.CTkFrame(parent, corner_radius=10)
-        card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        card.grid(row=0, column=0, sticky="nsew", padx=(3, 0))
         card.grid_columnconfigure(0, weight=1)
 
         head = ctk.CTkFrame(card, fg_color="transparent")
@@ -1019,16 +1048,23 @@ class App(ctk.CTk):
     def _build_log(self):
         self._log_collapsed = False
 
-        self.log_card = ctk.CTkFrame(self, corner_radius=10)
-        self.log_card.grid(row=2, column=0, sticky="nsew", padx=12, pady=(6, 12))
+        # The log card is the bottom pane of the vertical PanedWindow.
+        self.log_card = ctk.CTkFrame(self.vpane, corner_radius=10)
         self.log_card.grid_columnconfigure(0, weight=1)
         self.log_card.grid_rowconfigure(1, weight=1)
+        self.vpane.add(self.log_card, minsize=46, stretch="always")
+
+        # Set default vertical split after geometry finalises (~72/28).
+        def _place_vsash():
+            h = self.vpane.winfo_height()
+            if h > 1:
+                self.vpane.sash_place(0, 0, int(h * 0.72))
+        self.vpane.after(100, _place_vsash)
 
         head = ctk.CTkFrame(self.log_card, fg_color="transparent")
         head.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 4))
         head.grid_columnconfigure(0, weight=1)
 
-        # collapse/expand button — far left so it's obviously a toggle
         self.log_toggle_btn = ctk.CTkButton(
             head, text="\u25bc", width=28, height=24,
             font=ctk.CTkFont(size=11),
@@ -1065,19 +1101,20 @@ class App(ctk.CTk):
         self.log.configure(state="disabled")
 
     def toggle_log(self):
-        """Collapse or expand the raw serial log body."""
+        """Collapse or expand the log by moving the vertical pane sash."""
         self._log_collapsed = not self._log_collapsed
         if self._log_collapsed:
-            # hide the textbox, shrink the row to just the header
-            self.log.grid_remove()
-            self.log_card.grid_rowconfigure(1, weight=0, minsize=0)
-            self.grid_rowconfigure(2, weight=0, minsize=0)
+            # Save current sash Y so we can restore it.
+            self._log_sash_y = self.vpane.sash_coord(0)[1]
+            # Push the sash to leave only the header strip visible (~46 px).
+            total = self.vpane.winfo_height()
+            self.vpane.sash_place(0, 0, max(total - 46, 0))
             self.log_toggle_btn.configure(text="\u25b2")
         else:
-            # restore
-            self.log.grid()
-            self.log_card.grid_rowconfigure(1, weight=1)
-            self.grid_rowconfigure(2, weight=1, minsize=155)
+            # Restore previous sash position (fall back to 72% if never set).
+            y = getattr(self, "_log_sash_y",
+                        int(self.vpane.winfo_height() * 0.72))
+            self.vpane.sash_place(0, 0, y)
             self.log_toggle_btn.configure(text="\u25bc")
 
 
@@ -1135,15 +1172,23 @@ class App(ctk.CTk):
 
         self.win3d = ctk.CTkToplevel(self)
         self.win3d.title("3D View & GPS Map")
-        self.win3d.geometry("1000x540")
-        self.win3d.grid_columnconfigure(0, weight=1, uniform="v3")
-        self.win3d.grid_columnconfigure(1, weight=1, uniform="v3")
+        self.win3d.geometry("1100x600")
+        self.win3d.grid_columnconfigure(0, weight=1)
         self.win3d.grid_rowconfigure(0, weight=1)
         self.win3d.protocol("WM_DELETE_WINDOW", self._close_3d_window)
 
+        # PanedWindow gives a draggable sash between the two panels.
+        # sashwidth=6 makes it easy to grab; sashcursor shows a resize cursor.
+        paned = tk.PanedWindow(
+            self.win3d, orient=tk.HORIZONTAL,
+            sashwidth=6, sashpad=2, sashcursor="sb_h_double_arrow",
+            sashrelief="flat",
+            bg="#1c1c24" if ctk.get_appearance_mode() == "Dark" else "#dbdbdb",
+            bd=0)
+        paned.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+
         # Left: pseudo-3D boat
-        left = ctk.CTkFrame(self.win3d, corner_radius=10)
-        left.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=10)
+        left = ctk.CTkFrame(paned, corner_radius=10)
         left.grid_columnconfigure(0, weight=1)
         left.grid_rowconfigure(1, weight=1)
         ctk.CTkLabel(left, text="Boat (3D)",
@@ -1151,10 +1196,10 @@ class App(ctk.CTk):
             row=0, column=0, sticky="w", padx=14, pady=(12, 4))
         self.view3d = Boat3DView(left)
         self.view3d.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 12))
+        paned.add(left, minsize=280, stretch="always")
 
         # Right: GPS map
-        right = ctk.CTkFrame(self.win3d, corner_radius=10)
-        right.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=10)
+        right = ctk.CTkFrame(paned, corner_radius=10)
         right.grid_columnconfigure(0, weight=1)
         right.grid_rowconfigure(1, weight=1)
         ctk.CTkLabel(right, text="Position (GPS)",
@@ -1171,6 +1216,12 @@ class App(ctk.CTk):
                          justify="center").grid(row=1, column=0, padx=20,
                                                 pady=20)
             self.mapview = None
+        paned.add(right, minsize=280, stretch="always")
+
+        # Default sash position: 40% left, 60% right — set after the window
+        # is mapped so the geometry is finalised.
+        self.win3d.after(50, lambda: paned.sash_place(0, int(paned.winfo_width() * 0.4), 0)
+                         if paned.winfo_width() > 1 else None)
 
         # Seed with the latest known state
         self._refresh_3d_from_latest()
