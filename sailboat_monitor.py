@@ -24,8 +24,7 @@ import customtkinter as ctk
 import serial
 import serial.tools.list_ports
 
-from parsing import (parse_sail_rudder, parse_xbee, fmt_value,
-                     TELEMETRY_FIELDS)
+from parsing import (parse_sail_rudder, parse_xbee, fmt_value, TELEMETRY_FIELDS)
 from serial_io import is_stlink, SerialReader
 from widgets import CenteredBar, BoatView, WindRose, TrendPlot
 from boat3d import Boat3DView
@@ -37,8 +36,8 @@ from recording import Recorder
 # --------------------------------------------------------------------------- #
 
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "460800"]
-MAX_LOG_LINES = 2000
-PORT_POLL_MS = 1500  # how often to scan for COM-port hot-plug / unplug
+MAX_LOG_LINES = 200000
+PORT_POLL_MS = 1000  # how often to scan for COM-port hot-plug / unplug
 
 # The sail is a continuous-rotation drive, not a positional servo: a negative
 # command spins it anti-clockwise (viewed from above), a positive command spins
