@@ -1,1 +1,12 @@
 /.guienv
+/.vscode
+/target
+/.idea
+/.__pycache__
+/.mypy_cache
+__pycache__/boat3d.cpython-314.pyc
+__pycache__/parsing.cpython-314.pyc
+__pycache__/recording.cpython-314.pyc
+__pycache__/serial_io.cpython-314.pyc
+__pycache__/theme.cpython-314.pyc
+__pycache__/widgets.cpython-314.pyc

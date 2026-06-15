@@ -88,7 +88,22 @@ If both commands print a version, Python is installed correctly. If you get
 git clone <this-repo-url>
 ```
 
-Either way, you should end up with a folder containing **`sailboat_monitor.py`**.
+Either way, you should end up with a folder containing all the project files
+(see below). Keep them in the same folder — they import each other.
+
+### Project files
+
+The code is split into modules by feature:
+
+| File | What it does |
+|------|--------------|
+| `sailboat_monitor.py` | Main app and window. Run this one. |
+| `parsing.py` | Reads the controller and telemetry serial lines, formats values. |
+| `serial_io.py` | Detects ST-Link ports, reads the port in a background thread. |
+| `widgets.py` | 2D gauges, top-down boat view, wind rose, trend plot. |
+| `boat3d.py` | 3D boat view (matplotlib). |
+| `recording.py` | Saves telemetry to CSV and exports the GPS track as GPX. |
+| `theme.py` | Light/dark color helpers shared by the widgets. |
 
 ---
 
@@ -138,7 +153,6 @@ see the error message instead of a window that silently never appears.)
    garbled characters, the baud is wrong.
 3. You'll see:
    - **Sail / Rudder gauges** — your joystick commands.
-     - **NOTE:** Rudder in the "actual view" only changes when the rpi sends tra values in autonomous operations, it is jot supposed to move from controller inputs
    - **Commanded** boat tile — where the sail *should* be (modeled).
    - **Actual** boat tile — where the boat *reports* the sail is (from telemetry).
    - **Sailboat Telemetry** panel — the full XBee data.
@@ -169,3 +183,12 @@ From the project folder:
 pip install -r requirements.txt
 python sailboat_monitor.py
 ```
+
+---
+
+## Notes for tuning
+
+A couple of constants near the top of `sailboat_monitor.py` you may want to adjust:
+
+- **`SAIL_ROTATION_RATE_DPS`** — slew rate (deg/s) the *commanded* sail is animated at.
+- **`SAIL_CMD_DEADBAND`** — joystick deadband below which the commanded sail holds still.

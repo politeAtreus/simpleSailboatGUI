@@ -1,770 +1,35 @@
-"""
-Sailboat Ground Station Monitor
-================================
-A CustomTkinter (Windows) GUI for monitoring the serial output of the
-STM32 joystick controller used in the autonomous boat project.
+"""Sailboat Ground Station Monitor.
 
-It parses TWO kinds of lines that the controller prints over the COM port
-(this is the ST-Link / debug UART you are watching in PuTTY):
+A CustomTkinter GUI for watching the STM32 joystick controller's serial
+output. It parses two line types over the COM port:
 
-1) Controller status line (printed continuously):
-
+1. Controller status (printed continuously):
        sail=-19  rudder=0  | dropped=0  overruns=0
 
-   - sail     : left-joystick sail command     (-45 .. +45)
-   - rudder   : right-joystick rudder command   (-45 .. +45)
-   - dropped  : dropped XBee packet counter
-   - overruns : UART / packet overrun counter
-
-2) Radio telemetry echoed back from the boat PCB (only when in range):
-
-       XBee RX: {"tb":0,"tlat":0,...,"wa":0"sa":347,}
-
-   NOTE: in the screenshot this payload is *almost* JSON but is slightly
-   malformed -- there is a missing comma between "wa":0 and "sa":347 and a
-   trailing comma before the closing brace. So we deliberately do NOT use
-   json.loads(); we use a tolerant "key":value regex that survives the
-   missing/extra commas and any field ordering.
-
-Requirements:
-    pip install customtkinter pyserial
+2. Telemetry echoed back from the boat over XBee:
+       XBee RX: {"tb":0,...,"sa":347}
 
 Run:
+    pip install -r requirements.txt
     python sailboat_monitor.py
 """
 
-import csv
-import math
-import os
 import queue
-import re
 import threading
 import time
 import tkinter as tk
-from collections import deque
 from datetime import datetime
 
 import customtkinter as ctk
 import serial
 import serial.tools.list_ports
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-# --------------------------------------------------------------------------- #
-# Parsing
-# --------------------------------------------------------------------------- #
-
-# sail=-19  rudder=0  | dropped=0  overruns=0
-SAIL_RUDDER_RE = re.compile(
-    r"sail\s*=\s*(-?\d+)\s+rudder\s*=\s*(-?\d+)\s*\|\s*"
-    r"dropped\s*=\s*(\d+)\s+overruns\s*=\s*(\d+)"
-)
-
-# Tolerant "key":value matcher.  Handles ints, floats and negatives.
-# It ignores commas entirely, so the malformed JSON in the screenshot
-# (missing comma / trailing comma) parses cleanly.
-KV_RE = re.compile(r'"([A-Za-z_]\w*)"\s*:\s*(-?\d+(?:\.\d+)?)')
-
-
-def parse_sail_rudder(line: str):
-    """Return dict for a controller status line, or None."""
-    m = SAIL_RUDDER_RE.search(line)
-    if not m:
-        return None
-    return {
-        "sail": int(m.group(1)),
-        "rudder": int(m.group(2)),
-        "dropped": int(m.group(3)),
-        "overruns": int(m.group(4)),
-    }
-
-
-def parse_xbee(line: str):
-    """Return dict of telemetry fields for an 'XBee RX:' line, or None."""
-    if "XBee RX" not in line:
-        return None
-    payload = line.split("XBee RX:", 1)[1]
-    pairs = KV_RE.findall(payload)
-    if not pairs:
-        return None
-    out = {}
-    for key, raw in pairs:
-        out[key] = float(raw) if "." in raw else int(raw)
-    return out
-
-
-# Telemetry field metadata.  The human-readable labels are my best guess
-# at your protocol (t* = target/setpoint, c* = current boat state); they
-# are easy to rename here without touching anything else.
-TELEMETRY_FIELDS = [
-    # key,    label,                 group
-    ("tb",   "Target Bearing",       "Target / Setpoints"),
-    ("tlat", "Target Latitude",      "Target / Setpoints"),
-    ("tlon", "Target Longitude",     "Target / Setpoints"),
-    ("tsa",  "Target Sail Angle",    "Target / Setpoints"),
-    ("tfa",  "Target Flap Angle",    "Target / Setpoints"),
-    ("tra",  "Target Rudder Angle",  "Target / Setpoints"),
-    ("clat", "Current Latitude",     "Boat State"),
-    ("clon", "Current Longitude",    "Boat State"),
-    ("cb",   "Current Bearing",      "Boat State"),
-    ("wa",   "Wind Angle",           "Boat State"),
-    ("sa",   "Sail Angle",           "Boat State"),
-]
-
-DEGREE_FIELDS = {"tb", "tsa", "tfa", "tra", "cb", "wa", "sa"}
-LATLON_FIELDS = {"tlat", "tlon", "clat", "clon"}
-
-
-def fmt_value(key: str, v) -> str:
-    if key in LATLON_FIELDS:
-        return f"{float(v):.6f}"
-    if isinstance(v, float):
-        s = f"{v:.2f}"
-    else:
-        s = str(v)
-    if key in DEGREE_FIELDS:
-        s += "\u00b0"
-    return s
-
-
-def is_stlink(port) -> bool:
-    """True if a pyserial ListPortInfo looks like an ST-Link Virtual COM Port.
-
-    Matches on the description text (covers the various wordings Windows uses:
-    'STMicroelectronics STLink Virtual COM Port', 'ST-Link', etc.) and, as a
-    fallback, on the STMicroelectronics USB vendor ID 0x0483.
-    """
-    desc = (port.description or "").lower()
-    if "stlink" in desc or "st-link" in desc or "st link" in desc:
-        return True
-    if getattr(port, "vid", None) == 0x0483:
-        return True
-    return False
-
-
-# --------------------------------------------------------------------------- #
-# Centered bar widget (for sail / rudder, which swing -45 .. +45 about zero)
-# --------------------------------------------------------------------------- #
-
-def _resolve_color(color):
-    """Pick the light or dark variant from a CTk colour.
-
-    CustomTkinter colours are often a [light, dark] pair; raw tkinter canvases
-    can't use that, so resolve to a single value for the current mode.
-    """
-    if isinstance(color, (list, tuple)):
-        return color[0] if ctk.get_appearance_mode() == "Light" else color[1]
-    return color
-
-
-class CenteredBar(tk.Canvas):
-    """A horizontal gauge that fills left or right from a centre line.
-
-    Because this is a raw tkinter Canvas (not a CTk widget) it does NOT follow
-    set_appearance_mode automatically, so it recomputes its colours from the
-    current mode on every draw and exposes refresh_theme() for the toggle.
-    """
-
-    def __init__(self, master, width=360, height=42, vmin=-45, vmax=45,
-                 fill="#3b8ed0", **kwargs):
-        super().__init__(master, width=width, height=height,
-                         highlightthickness=0, **kwargs)
-        self.master_frame = master
-        self.w, self.h = width, height
-        self.vmin, self.vmax = vmin, vmax
-        self.fill_color = fill
-        self.value = 0
-        self.bind("<Configure>", lambda e: self._draw())
-        self.refresh_theme()
-
-    def set_value(self, v):
-        self.value = max(self.vmin, min(self.vmax, v))
-        self._draw()
-
-    def refresh_theme(self):
-        """Match the canvas background to the parent card and redraw."""
-        self.configure(bg=self._bg_color())
-        self._draw()
-
-    def _bg_color(self):
-        try:
-            c = _resolve_color(self.master_frame.cget("fg_color"))
-        except Exception:
-            c = None
-        if not c or c == "transparent":
-            return "#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#dbdbdb"
-        return c
-
-    def _palette(self):
-        if ctk.get_appearance_mode() == "Light":
-            return {"track": "#c9c9cf", "tick": "#9a9aa5",
-                    "center": "#55555f", "knob": "#ffffff"}
-        return {"track": "#2a2a36", "tick": "#4a4a5a",
-                "center": "#8a8aa0", "knob": "#ffffff"}
-
-    def _draw(self):
-        self.delete("all")
-        pal = self._palette()
-        w = self.winfo_width() or self.w
-        h = self.winfo_height() or self.h
-        pad = 12
-        track_h = 14
-        cx = w / 2
-        cy = h / 2
-        left, right = pad, w - pad
-        top, bot = cy - track_h / 2, cy + track_h / 2
-
-        # background track
-        self.create_rectangle(left, top, right, bot, fill=pal["track"],
-                              outline="")
-        # ticks at min / centre / max
-        for frac in (0.0, 0.5, 1.0):
-            x = left + frac * (right - left)
-            self.create_line(x, top - 5, x, bot + 5, fill=pal["tick"], width=1)
-        # centre line emphasised
-        self.create_line(cx, top - 7, cx, bot + 7, fill=pal["center"], width=2)
-
-        # fill from centre toward the value
-        if self.value >= 0:
-            x = cx + (self.value / self.vmax) * (right - cx)
-            self.create_rectangle(cx, top, x, bot, fill=self.fill_color,
-                                  outline="")
-        else:
-            x = cx - (self.value / self.vmin) * (cx - left)
-            self.create_rectangle(x, top, cx, bot, fill=self.fill_color,
-                                  outline="")
-        # knob
-        r = 7
-        self.create_oval(x - r, cy - r, x + r, cy + r,
-                         fill=self._palette()["knob"], outline=self.fill_color,
-                         width=2)
-
-
-# --------------------------------------------------------------------------- #
-# Boat view widget (top-down schematic: sail pivots at centre, rudder at stern)
-# --------------------------------------------------------------------------- #
-
-class BoatView(tk.Canvas):
-    """Top-down boat schematic. Bow points up.
-
-    The sail rotates about the mast at the centre of the hull and the rudder
-    rotates about its pivot at the stern, both driven by the live joystick
-    angles (-45 .. +45 deg). Positive angle swings to starboard (right).
-    """
-
-    SAIL_COLOR = "#3b8ed0"     # matches the sail gauge / value
-    RUDDER_COLOR = "#e8a33d"   # matches the rudder gauge / value
-
-    def __init__(self, master, width=300, height=240, **kwargs):
-        super().__init__(master, width=width, height=height,
-                         highlightthickness=0, **kwargs)
-        self.master_frame = master
-        self.w, self.h = width, height
-        self.sail_angle = 0.0
-        self.rudder_angle = 0.0
-        self.bind("<Configure>", lambda e: self._draw())
-        self.refresh_theme()
-
-    def set_angles(self, sail, rudder):
-        self.sail_angle = float(sail)
-        self.rudder_angle = float(rudder)
-        self._draw()
-
-    def refresh_theme(self):
-        self.configure(bg=self._bg_color())
-        self._draw()
-
-    def _bg_color(self):
-        try:
-            c = _resolve_color(self.master_frame.cget("fg_color"))
-        except Exception:
-            c = None
-        if not c or c == "transparent":
-            return "#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#dbdbdb"
-        return c
-
-    def _palette(self):
-        if ctk.get_appearance_mode() == "Light":
-            return {"hull": "#c2c6cf", "outline": "#5a5a66", "pivot": "#3a3a44",
-                    "label": "#55555f"}
-        return {"hull": "#3a3a48", "outline": "#9a9aac", "pivot": "#dcdce6",
-                "label": "#9a9aa5"}
-
-    @staticmethod
-    def _rotate(px, py, cx, cy, deg):
-        """Rotate (px,py) about (cx,cy). 0 deg = straight aft (downward),
-        positive = toward starboard (screen right) to match the gauges, which
-        fill right for positive values. The angle is negated because the canvas
-        y-axis points down."""
-        r = math.radians(-deg)
-        dx, dy = px - cx, py - cy
-        rx = dx * math.cos(r) - dy * math.sin(r)
-        ry = dx * math.sin(r) + dy * math.cos(r)
-        return cx + rx, cy + ry
-
-    def _draw(self):
-        self.delete("all")
-        pal = self._palette()
-        w = self.winfo_width() or self.w
-        h = self.winfo_height() or self.h
-        cx = w / 2
-        cy = h * 0.45          # shift up so the rudder has room below
-        L = h * 0.30           # hull half-length
-        W = min(w * 0.16, L * 0.55)  # hull half-width
-
-        # ---- hull (smoothed polygon, bow at top) ----
-        hull = [
-            cx, cy - L,                        # bow tip
-            cx + W * 0.85, cy - L * 0.40,
-            cx + W, cy + L * 0.15,
-            cx + W * 0.70, cy + L * 0.80,
-            cx + W * 0.45, cy + L,             # starboard stern
-            cx - W * 0.45, cy + L,             # port stern
-            cx - W * 0.70, cy + L * 0.80,
-            cx - W, cy + L * 0.15,
-            cx - W * 0.85, cy - L * 0.40,
-        ]
-        self.create_polygon(hull, fill=pal["hull"], outline=pal["outline"],
-                            width=2, smooth=True)
-
-        # ---- mast + sail (pivots at hull centre) ----
-        # 0 deg = bow (boom points forward, straight up). Increasing angle
-        # rotates clockwise (1,2,3...). The boom base point below is aft of the
-        # mast: '180 - angle' puts 0 at the bow and makes the sweep clockwise.
-        # Shared by both boat tiles.
-        mast_x, mast_y = cx, cy
-        boom_len = L * 0.85
-        tip = self._rotate(mast_x, mast_y + boom_len, mast_x, mast_y,
-                           180.0 - self.sail_angle)
-        self.create_line(mast_x, mast_y, tip[0], tip[1],
-                        fill=self.SAIL_COLOR, width=7, capstyle="round")
-        self.create_oval(mast_x - 5, mast_y - 5, mast_x + 5, mast_y + 5,
-                        fill=pal["pivot"], outline="")
-
-        # ---- rudder (pivots at the stern) ----
-        rud_x, rud_y = cx, cy + L
-        rud_len = L * 0.45
-        rtip = self._rotate(rud_x, rud_y + rud_len, rud_x, rud_y,
-                           self.rudder_angle)
-        self.create_line(rud_x, rud_y, rtip[0], rtip[1],
-                        fill=self.RUDDER_COLOR, width=6, capstyle="round")
-        self.create_oval(rud_x - 4, rud_y - 4, rud_x + 4, rud_y + 4,
-                        fill=pal["pivot"], outline="")
-
-        # ---- small captions ----
-        self.create_text(cx, cy - L - 10, text="BOW", fill=pal["label"],
-                        font=("TkDefaultFont", 8))
-        self.create_text(cx + W + 14, mast_y, text=f"Sail {self.sail_angle:.0f}\u00b0",
-                        fill=self.SAIL_COLOR, font=("TkDefaultFont", 9, "bold"),
-                        anchor="w")
-        self.create_text(cx + 12, rud_y + rud_len * 0.6,
-                        text=f"Rudder {self.rudder_angle:.0f}\u00b0",
-                        fill=self.RUDDER_COLOR,
-                        font=("TkDefaultFont", 9, "bold"), anchor="w")
-
-
-# --------------------------------------------------------------------------- #
-# Pseudo-3D boat view (orthographic projection on a plain tkinter Canvas)
-# --------------------------------------------------------------------------- #
-
-def _rot_z(p, deg):
-    """Yaw a 3D point about the vertical (z) axis through the origin."""
-    a = math.radians(deg)
-    x, y, z = p
-    return (x * math.cos(a) - y * math.sin(a),
-            x * math.sin(a) + y * math.cos(a), z)
-
-
-def _rot_z_about(p, deg, ox, oy):
-    """Yaw a 3D point about a vertical axis through (ox, oy)."""
-    a = math.radians(deg)
-    x, y, z = p
-    dx, dy = x - ox, y - oy
-    return (ox + dx * math.cos(a) - dy * math.sin(a),
-            oy + dx * math.sin(a) + dy * math.cos(a), z)
-
-
-
-
-class Boat3DView(tk.Frame):
-    """3D boat view using matplotlib Poly3DCollection.
-
-    Replaces the hand-rolled painter's algorithm with matplotlib's proper
-    depth buffer so the boat renders correctly at any heading. Mouse
-    interaction (rotate, zoom) comes free from matplotlib.
-    """
-
-    SAIL_COLOR   = "#3b8ed0"
-    RUDDER_COLOR = "#e8a33d"
-    _INIT_ELEV   = 25.0
-    _INIT_AZIM   = 225.0
-
-    def __init__(self, master, width=460, height=460, **kwargs):
-        for k in ("highlightthickness",):
-            kwargs.pop(k, None)
-        super().__init__(master, **kwargs)
-        self.master_frame  = master
-        self.heading       = 0.0
-        self.sail_angle    = 0.0
-        self.rudder_angle  = 0.0
-
-        self.fig = Figure(figsize=(width / 100.0, height / 100.0), dpi=100)
-        self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-        self.ax  = self.fig.add_subplot(111, projection="3d")
-
-        self.mpl_canvas = FigureCanvasTkAgg(self.fig, master=self)
-        self.mpl_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
-
-        self._draw()
-
-    # ------------------------------------------------------------------ #
-    def set_state(self, heading, sail, rudder):
-        self.heading      = float(heading)
-        self.sail_angle   = float(sail)
-        self.rudder_angle = float(rudder)
-        self._draw()
-
-    def refresh_theme(self):
-        self._draw()
-
-    # ------------------------------------------------------------------ #
-    def _palette(self):
-        dark = ctk.get_appearance_mode() == "Dark"
-        if not dark:
-            return {"water": "#b9c4cf", "deck": "#dde4ec",
-                    "hull_stbd": "#8090a0", "hull_port": "#707888",
-                    "hull_dark": "#505868", "keel": "#353c4a",
-                    "mast": "#404858", "label": "#283040",
-                    "outline": "#1c2430", "bg": "#f0f2f8"}
-        return {"water": "#2f3a44",   "deck": "#7a8898",
-                "hull_stbd": "#32394c", "hull_port": "#22283a",
-                "hull_dark": "#13151e",  "keel": "#0c0e14",
-                "mast": "#d0d4e0",      "label": "#c8ccdc",
-                "outline": "#080a10",   "bg": "#1c1c24"}
-
-    @staticmethod
-    def _rot_z(pts, deg):
-        """Rotate (x,y,z) list about the z-axis."""
-        a = math.radians(deg)
-        c, s = math.cos(a), math.sin(a)
-        return [(x * c - y * s, x * s + y * c, z) for x, y, z in pts]
-
-    @staticmethod
-    def _rot_z_about(pts, deg, ox, oy):
-        """Rotate (x,y,z) list about a vertical axis through (ox, oy)."""
-        a = math.radians(deg)
-        c, s = math.cos(a), math.sin(a)
-        out = []
-        for x, y, z in pts:
-            dx, dy = x - ox, y - oy
-            out.append((ox + dx * c - dy * s, oy + dx * s + dy * c, z))
-        return out
-
-    def _draw(self):
-        pal = self._palette()
-
-        # Preserve the user's rotated viewpoint across redraws.
-        try:
-            elev, azim = self.ax.elev, self.ax.azim
-        except Exception:
-            elev, azim = self._INIT_ELEV, self._INIT_AZIM
-
-        self.ax.cla()
-
-        # Background + clean axes
-        self.fig.patch.set_facecolor(pal["bg"])
-        self.ax.set_facecolor(pal["bg"])
-        self.ax.set_axis_off()
-        self.ax.view_init(elev=elev, azim=azim)
-        for pane in (self.ax.xaxis.pane, self.ax.yaxis.pane,
-                     self.ax.zaxis.pane):
-            pane.fill = False
-            pane.set_edgecolor("none")
-
-        # ---- boat geometry (boat frame: y=bow, x=stbd, z=up) ----
-        deck_z, bot_z = 0.16, -0.22
-        top = [(0, 1.85, deck_z), (0.20, 1.05, deck_z), (0.30, 0.0, deck_z),
-               (0.26, -1.05, deck_z), (0.15, -1.6, deck_z),
-               (-0.15, -1.6, deck_z), (-0.26, -1.05, deck_z),
-               (-0.30, 0.0, deck_z), (-0.20, 1.05, deck_z)]
-        bot = [(0, 1.7, bot_z), (0.10, 1.05, bot_z), (0.15, 0.0, bot_z),
-               (0.13, -1.05, bot_z), (0.07, -1.5, bot_z),
-               (-0.07, -1.5, bot_z), (-0.13, -1.05, bot_z),
-               (-0.15, 0.0, bot_z), (-0.10, 1.05, bot_z)]
-
-        def H(pts):
-            return self._rot_z(pts, -self.heading)
-
-        top_h = H(top)
-        bot_h = H(bot)
-
-        # Deck and hull bottom
-        self.ax.add_collection3d(Poly3DCollection(
-            [top_h], facecolors=pal["deck"],
-            edgecolors=pal["outline"], linewidths=0.8))
-        self.ax.add_collection3d(Poly3DCollection(
-            [bot_h], facecolors=pal["hull_dark"],
-            edgecolors=pal["outline"], linewidths=0.8))
-
-        # Hull sides — port panels darker than starboard for depth cue
-        stbd, port = [], []
-        m = len(top)
-        for i in range(m):
-            j = (i + 1) % m
-            face = [top_h[i], top_h[j], bot_h[j], bot_h[i]]
-            if (top[i][0] + top[j][0]) >= 0:
-                stbd.append(face)
-            else:
-                port.append(face)
-        self.ax.add_collection3d(Poly3DCollection(
-            stbd, facecolors=pal["hull_stbd"],
-            edgecolors=pal["outline"], linewidths=0.8))
-        self.ax.add_collection3d(Poly3DCollection(
-            port, facecolors=pal["hull_port"],
-            edgecolors=pal["outline"], linewidths=0.8))
-
-        # Keel
-        keel_y, keel_d = 0.05, -1.85
-        keel_pts = H([(0, keel_y + 0.32, bot_z), (0, keel_y - 0.34, bot_z),
-                      (0, keel_y - 0.10, keel_d), (0, keel_y + 0.10, keel_d)])
-        self.ax.add_collection3d(Poly3DCollection(
-            [keel_pts], facecolors=pal["keel"],
-            edgecolors=pal["keel"], linewidths=0.5))
-
-        # Rudder (yaws with rudder angle)
-        rpx, rpy = 0.0, -1.50
-        rud_raw = [(0, -1.44, -0.16), (0, -1.60, -0.16),
-                   (0, -1.54, -0.92), (0, -1.38, -0.92)]
-        rud_pts = H(self._rot_z_about(rud_raw, self.rudder_angle, rpx, rpy))
-        self.ax.add_collection3d(Poly3DCollection(
-            [rud_pts], facecolors=self.RUDDER_COLOR,
-            edgecolors=self.RUDDER_COLOR, linewidths=0.5))
-
-        # Wing sail
-        th = math.radians(self.sail_angle)
-        dx_s, dy_s = math.sin(th), math.cos(th)
-        chord, wing_top_z, mast_y = 0.62, 2.7, 0.0
-        le_b = (0, mast_y, deck_z);            le_t = (0, mast_y, wing_top_z)
-        te_b = (chord * dx_s, mast_y + chord * dy_s, deck_z)
-        te_t = (chord * dx_s, mast_y + chord * dy_s, wing_top_z)
-        sail_pts = H([le_b, te_b, te_t, le_t])
-        self.ax.add_collection3d(Poly3DCollection(
-            [sail_pts], facecolors=self.SAIL_COLOR,
-            edgecolors="#1c2e3c", linewidths=1.0, alpha=0.9))
-
-        # Mast pole and bow wind-sensor
-        le_b_h, le_t_h = H([le_b])[0], H([le_t])[0]
-        self.ax.plot([le_b_h[0], le_t_h[0]], [le_b_h[1], le_t_h[1]],
-                    [le_b_h[2], le_t_h[2]], color=pal["mast"], linewidth=2)
-        wp = H([(0, 0.95, deck_z), (0, 0.95, deck_z + 0.55)])
-        self.ax.plot([wp[0][0], wp[1][0]], [wp[0][1], wp[1][1]],
-                    [wp[0][2], wp[1][2]], color=pal["mast"], linewidth=1.5)
-        self.ax.scatter(*wp[1], color=pal["deck"], s=20, zorder=5)
-
-        # Water grid
-        for v in (-2.4, -1.2, 0, 1.2, 2.4):
-            self.ax.plot([-2.4, 2.4], [v, v], [0, 0],
-                        color=pal["water"], lw=0.5)
-            self.ax.plot([v, v], [-2.4, 2.4], [0, 0],
-                        color=pal["water"], lw=0.5)
-
-        self.ax.set_xlim(-2.5, 2.5)
-        self.ax.set_ylim(-2.5, 2.5)
-        self.ax.set_zlim(-2.0, 3.2)
-        self.ax.set_box_aspect([1, 1, 1.3])
-
-        # Captions in axes-space so they're never occluded by 3D geometry
-        kw = dict(transform=self.ax.transAxes, fontsize=14,
-                  fontweight="bold", va="top")
-        self.ax.text2D(0.03, 0.97, f"Heading {self.heading:.0f}\u00b0",
-                      color=pal["label"], **kw)
-        self.ax.text2D(0.03, 0.88, f"Sail {self.sail_angle:.0f}\u00b0",
-                      color=self.SAIL_COLOR, **kw)
-        self.ax.text2D(0.03, 0.79, f"Rudder {self.rudder_angle:.0f}\u00b0",
-                      color=self.RUDDER_COLOR, **kw)
-
-        self.mpl_canvas.draw_idle()
-
-
-
-
-# --------------------------------------------------------------------------- #
-# Wind rose + rolling trend plot (plain tkinter canvases)
-# --------------------------------------------------------------------------- #
-
-def _canvas_bg(master_frame):
-    """Resolve a canvas background that matches its parent CTk frame."""
-    try:
-        c = _resolve_color(master_frame.cget("fg_color"))
-    except Exception:
-        c = None
-    if not c or c == "transparent":
-        return "#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#dbdbdb"
-    return c
-
-
-class WindRose(tk.Canvas):
-    """Compass-style dial for the wind angle (wa), bow at the top.
-
-    wa is treated as degrees clockwise from the bow (0 = wind from dead ahead).
-    """
-
-    COLOR = "#5fd0a0"
-
-    def __init__(self, master, size=150, **kwargs):
-        super().__init__(master, width=size, height=size,
-                         highlightthickness=0, **kwargs)
-        self.master_frame = master
-        self.size = size
-        self.wind = 0.0
-        self.bind("<Configure>", lambda e: self._draw())
-        self.refresh_theme()
-
-    def set_wind(self, wa):
-        self.wind = float(wa) % 360.0
-        self._draw()
-
-    def refresh_theme(self):
-        self.configure(bg=_canvas_bg(self.master_frame))
-        self._draw()
-
-    def _palette(self):
-        if ctk.get_appearance_mode() == "Light":
-            return {"ring": "#9a9aa5", "tick": "#7a7a85", "label": "#55555f",
-                    "boat": "#5a5a66"}
-        return {"ring": "#54596a", "tick": "#6c6f80", "label": "#9a9aa5",
-                "boat": "#c8c8d4"}
-
-    def _draw(self):
-        self.delete("all")
-        pal = self._palette()
-        w = self.winfo_width() or self.size
-        h = self.winfo_height() or self.size
-        cx, cy = w / 2.0, h / 2.0 + 4
-        r = min(w, h) / 2.0 - 16
-
-        self.create_oval(cx - r, cy - r, cx + r, cy + r,
-                        outline=pal["ring"], width=2)
-        # cardinal ticks
-        for ang in (0, 90, 180, 270):
-            a = math.radians(ang)
-            x1 = cx + (r - 6) * math.sin(a); y1 = cy - (r - 6) * math.cos(a)
-            x2 = cx + r * math.sin(a);       y2 = cy - r * math.cos(a)
-            self.create_line(x1, y1, x2, y2, fill=pal["tick"], width=1)
-        self.create_text(cx, cy - r - 7, text="BOW", fill=pal["label"],
-                        font=("TkDefaultFont", 8))
-
-        # boat indicator at centre (small triangle pointing to the bow / up)
-        self.create_polygon(cx, cy - 9, cx - 5, cy + 7, cx + 5, cy + 7,
-                           fill=pal["boat"], outline="")
-
-        # wind arrow: wind comes FROM bearing `wind` (clockwise from bow)
-        a = math.radians(self.wind)
-        fx = cx + r * math.sin(a); fy = cy - r * math.cos(a)
-        self.create_line(fx, fy, cx, cy, fill=self.COLOR, width=3,
-                        arrow="last", arrowshape=(10, 12, 5))
-        self.create_text(cx, cy + r + 8, text=f"Wind {self.wind:.0f}\u00b0",
-                        fill=self.COLOR, font=("TkDefaultFont", 10, "bold"))
-
-
-class TrendPlot(tk.Canvas):
-    """Rolling 0-360 deg time-series of wind angle, heading and sail angle."""
-
-    CHANNELS = [("wa", "Wind", "#5fd0a0"),
-                ("cb", "Heading", "#c08ae0"),
-                ("sa", "Sail", "#3b8ed0")]
-    MAXLEN = 150  # ~2.5 min at 1 Hz telemetry
-
-    def __init__(self, master, width=320, height=150, **kwargs):
-        super().__init__(master, width=width, height=height,
-                         highlightthickness=0, **kwargs)
-        self.master_frame = master
-        self.w, self.h = width, height
-        self.data = {k: deque(maxlen=self.MAXLEN) for k, _, _ in self.CHANNELS}
-        self.bind("<Configure>", lambda e: self._draw())
-        self.refresh_theme()
-
-    def add_sample(self, wa, cb, sa):
-        self.data["wa"].append(float(wa) % 360.0)
-        self.data["cb"].append(float(cb) % 360.0)
-        self.data["sa"].append(float(sa) % 360.0)
-        self._draw()
-
-    def refresh_theme(self):
-        self.configure(bg=_canvas_bg(self.master_frame))
-        self._draw()
-
-    def _palette(self):
-        if ctk.get_appearance_mode() == "Light":
-            return {"axis": "#9a9aa5", "grid": "#cfcfd6", "label": "#55555f"}
-        return {"axis": "#54596a", "grid": "#333642", "label": "#9a9aa5"}
-
-    def _draw(self):
-        self.delete("all")
-        pal = self._palette()
-        w = self.winfo_width() or self.w
-        h = self.winfo_height() or self.h
-        left, right, top, bot = 30, w - 8, 8, h - 6
-
-        for val in (0, 90, 180, 270, 360):
-            y = bot - (val / 360.0) * (bot - top)
-            self.create_line(left, y, right, y, fill=pal["grid"], width=1)
-            self.create_text(left - 4, y, text=str(val), anchor="e",
-                            fill=pal["label"], font=("TkDefaultFont", 7))
-        self.create_line(left, top, left, bot, fill=pal["axis"], width=1)
-        self.create_line(left, bot, right, bot, fill=pal["axis"], width=1)
-
-        n = len(self.data["wa"])
-        span = max(n - 1, 1)
-        legx = left + 6
-        for key, label, color in self.CHANNELS:
-            vals = list(self.data[key])
-            if len(vals) >= 2:
-                pts = []
-                for i, v in enumerate(vals):
-                    x = left + (i / span) * (right - left)
-                    y = bot - (v / 360.0) * (bot - top)
-                    pts.extend((x, y))
-                self.create_line(*pts, fill=color, width=2)
-            cur = f"{vals[-1]:.0f}\u00b0" if vals else "--"
-            self.create_text(legx, top + 6, text=f"{label} {cur}", anchor="w",
-                            fill=color, font=("TkDefaultFont", 8, "bold"))
-            legx += 82
-
-
-# --------------------------------------------------------------------------- #
-# Serial reader thread
-# --------------------------------------------------------------------------- #
-
-class SerialReader(threading.Thread):
-    """Reads complete lines off the serial port and pushes them to a queue.
-
-    Runs in a background thread so the GUI never blocks.  All widget updates
-    happen on the main thread via App.poll_queue(), because tkinter is not
-    thread-safe.
-    """
-
-    def __init__(self, ser, out_queue, stop_event):
-        super().__init__(daemon=True)
-        self.ser = ser
-        self.out_queue = out_queue
-        self.stop_event = stop_event
-
-    def run(self):
-        while not self.stop_event.is_set():
-            try:
-                raw = self.ser.readline()  # blocks up to the port timeout
-            except (serial.SerialException, OSError) as e:
-                self.out_queue.put(("error", f"Serial error: {e}"))
-                return
-            if not raw:
-                continue
-            line = raw.decode("utf-8", errors="replace").strip("\r\n")
-            if line:
-                self.out_queue.put(("line", line))
+from parsing import (parse_sail_rudder, parse_xbee, fmt_value,
+                     TELEMETRY_FIELDS)
+from serial_io import is_stlink, SerialReader
+from widgets import CenteredBar, BoatView, WindRose, TrendPlot
+from boat3d import Boat3DView
+from recording import Recorder
 
 
 # --------------------------------------------------------------------------- #
@@ -772,8 +37,8 @@ class SerialReader(threading.Thread):
 # --------------------------------------------------------------------------- #
 
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "460800"]
-MAX_LOG_LINES = 200000
-PORT_POLL_MS = 1000  # how often to scan for COM-port hot-plug / unplug
+MAX_LOG_LINES = 2000
+PORT_POLL_MS = 1500  # how often to scan for COM-port hot-plug / unplug
 
 # The sail is a continuous-rotation drive, not a positional servo: a negative
 # command spins it anti-clockwise (viewed from above), a positive command spins
@@ -818,10 +83,7 @@ class App(ctk.CTk):
         self.wp_marker = None
         self.gps_track = []          # [(lat, lon, datetime)] recorded always
         # CSV recording
-        self.csv_file = None
-        self.csv_writer = None
-        self.csv_rows = 0
-        self.csv_path = None
+        self.recorder = Recorder()
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)   # single weighted row: the outer pane
@@ -1318,86 +580,36 @@ class App(ctk.CTk):
 
     # ----- recording: CSV + GPX ------------------------------------------- #
     def toggle_record(self):
-        if self.csv_file is None:
-            self.start_recording()
+        if not self.recorder.active:
+            ok, msg = self.recorder.start()
+            self.append_log(f"** {msg} **")
+            if ok:
+                self.record_btn.configure(text="\u25a0 Stop",
+                                          fg_color="#c0552e",
+                                          hover_color="#a8482a")
         else:
-            self.stop_recording()
-
-    def start_recording(self):
-        try:
-            os.makedirs("logs", exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.csv_path = os.path.join("logs", f"telemetry_{stamp}.csv")
-            self.csv_file = open(self.csv_path, "w", newline="")
-        except OSError as e:
-            self.append_log(f"** Could not start recording: {e} **")
-            self.csv_file = None
-            return
-        self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow(["timestamp"] +
-                                 [k for k, _, _ in TELEMETRY_FIELDS])
-        self.csv_rows = 0
-        self.record_btn.configure(text="\u25a0 Stop", fg_color="#c0552e",
-                                  hover_color="#a8482a")
-        self.append_log(f"** Recording to {self.csv_path} **")
-        self._update_record_status()
-
-    def stop_recording(self):
-        if self.csv_file is not None:
-            try:
-                self.csv_file.close()
-            except Exception:
-                pass
-        self.append_log(f"** Recording stopped: {self.csv_path} "
-                        f"({self.csv_rows} rows) **")
-        self.csv_file = None
-        self.csv_writer = None
-        self.record_btn.configure(text="\u25cf Record",
-                                  fg_color=self._rec_default_fg,
-                                  hover_color=self._rec_default_hover)
+            msg = self.recorder.stop()
+            self.append_log(f"** {msg} **")
+            self.record_btn.configure(text="\u25cf Record",
+                                      fg_color=self._rec_default_fg,
+                                      hover_color=self._rec_default_hover)
         self._update_record_status()
 
     def _record_row(self, d):
-        if self.csv_writer is None:
-            return
-        row = [datetime.now().isoformat(timespec="milliseconds")]
-        row += [d.get(k, "") for k, _, _ in TELEMETRY_FIELDS]
-        try:
-            self.csv_writer.writerow(row)
-            self.csv_rows += 1
-            self._update_record_status()
-        except Exception:
-            pass
+        self.recorder.write_row(d)
+        self._update_record_status()
 
     def _update_record_status(self):
-        if self.csv_file is not None:
-            self.record_status.configure(
-                text=f"\u25cf REC  {self.csv_rows} rows", text_color="#d05b5b")
+        if self.recorder.active:
+            self.record_status.configure(text=self.recorder.status_text(),
+                                         text_color="#d05b5b")
         else:
-            self.record_status.configure(text="not recording",
+            self.record_status.configure(text=self.recorder.status_text(),
                                          text_color=("gray45", "gray60"))
 
     def export_gpx(self):
-        if not self.gps_track:
-            self.append_log("** No GPS points to export yet. **")
-            return
-        try:
-            os.makedirs("logs", exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = os.path.join("logs", f"track_{stamp}.gpx")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-                f.write('<gpx version="1.1" creator="Sailboat Ground Station '
-                        'Monitor" xmlns="http://www.topografix.com/GPX/1/1">\n')
-                f.write(' <trk><name>Sailboat track</name><trkseg>\n')
-                for lat, lon, t in self.gps_track:
-                    f.write(f'  <trkpt lat="{lat:.7f}" lon="{lon:.7f}">'
-                            f'<time>{t.isoformat()}</time></trkpt>\n')
-                f.write(' </trkseg></trk>\n</gpx>\n')
-            self.append_log(f"** Exported {len(self.gps_track)} points to "
-                            f"{path} **")
-        except OSError as e:
-            self.append_log(f"** GPX export failed: {e} **")
+        ok, msg = self.recorder.export_gpx(self.gps_track)
+        self.append_log(f"** {msg} **")
 
     def watch_ports(self):
         """Periodically scan COM ports; auto-connect to a new ST-Link.
@@ -1670,8 +882,8 @@ class App(ctk.CTk):
 
     # ----- shutdown -------------------------------------------------------- #
     def on_close(self):
-        if self.csv_file is not None:
-            self.stop_recording()
+        if self.recorder.active:
+            self.append_log(f"** {self.recorder.stop()} **")
         self.disconnect()
         self.destroy()
 
