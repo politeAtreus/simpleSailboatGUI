@@ -103,6 +103,7 @@ The code is split into modules by feature:
 | `widgets.py` | 2D gauges, top-down boat view, wind rose, trend plot. |
 | `boat3d.py` | 3D boat view (matplotlib). |
 | `recording.py` | Saves telemetry to CSV and exports the GPS track as GPX. |
+| `waypoints.py` | Waypoint list shared by the map and the side panel. |
 | `theme.py` | Light/dark color helpers shared by the widgets. |
 
 ---

@@ -24,11 +24,14 @@ import customtkinter as ctk
 import serial
 import serial.tools.list_ports
 
-from parsing import (parse_sail_rudder, parse_xbee, fmt_value, TELEMETRY_FIELDS)
+from parsing import (parse_sail_rudder, parse_xbee, fmt_value,
+                     TELEMETRY_FIELDS)
 from serial_io import is_stlink, SerialReader
 from widgets import CenteredBar, BoatView, WindRose, TrendPlot
 from boat3d import Boat3DView
 from recording import Recorder
+from waypoints import (WaypointStore, WaypointPanel, WaypointMapLayer,
+                       STATUS_IDLE, STATUS_NEXT, STATUS_ACTIVE, STATUS_SKIPPED)
 
 
 # --------------------------------------------------------------------------- #
@@ -80,9 +83,15 @@ class App(ctk.CTk):
         self.mapview = None
         self.boat_marker = None
         self.wp_marker = None
+        self.breadcrumb_path = None
         self.gps_track = []          # [(lat, lon, datetime)] recorded always
         # CSV recording
         self.recorder = Recorder()
+        # Waypoints (shared between main panel and map view)
+        self.waypoints = WaypointStore()
+        self.wp_map_layer = None     # created with the 3D window
+        self._wp_panel_collapsed = False
+        self._wp_sash_x = None
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)   # single weighted row: the outer pane
@@ -152,12 +161,20 @@ class App(ctk.CTk):
         sash_kw = dict(sashwidth=6, sashpad=2, sashrelief="flat",
                        bg=sash_bg, bd=0)
 
-        # Outer vertical pane: top = controller+telemetry, bottom = log.
-        self.vpane = tk.PanedWindow(self, orient=tk.VERTICAL,
-                                    sashcursor="sb_v_double_arrow", **sash_kw)
-        self.vpane.grid(row=1, column=0, sticky="nsew", padx=12, pady=(6, 6))
+        # Outer horizontal pane: left = main content, right = waypoint panel.
+        self.outer_pane = tk.PanedWindow(self, orient=tk.HORIZONTAL,
+                                         sashcursor="sb_h_double_arrow",
+                                         **sash_kw)
+        self.outer_pane.grid(row=1, column=0, sticky="nsew", padx=12,
+                             pady=(6, 6))
 
-        # Inner horizontal pane: left = controller, right = telemetry.
+        # Left side: the existing vertical pane (panels on top, log on bottom).
+        left_wrap = tk.Frame(self.outer_pane, bg=sash_bg)
+        self.vpane = tk.PanedWindow(left_wrap, orient=tk.VERTICAL,
+                                    sashcursor="sb_v_double_arrow", **sash_kw)
+        self.vpane.pack(fill=tk.BOTH, expand=True)
+
+        # Inner horizontal pane inside vpane: controller | telemetry.
         panels_bg = tk.Frame(self.vpane, bg=sash_bg)
         self.hpane = tk.PanedWindow(panels_bg, orient=tk.HORIZONTAL,
                                     sashcursor="sb_h_double_arrow", **sash_kw)
@@ -176,15 +193,61 @@ class App(ctk.CTk):
         self.hpane.add(telem_wrap, minsize=350, stretch="always")
 
         self.vpane.add(panels_bg, minsize=280, stretch="always")
+        self.outer_pane.add(left_wrap, minsize=600, stretch="always")
 
-        # Set initial sash positions after the window geometry is finalised.
-        # Horizontal: 2:5 controller, 3:5 telemetry (same as previous weights).
-        # Vertical: ~72% panels, 28% log.
+        # Right side: waypoint panel (with a thin collapse toggle column).
+        wp_wrap = tk.Frame(self.outer_pane, bg=sash_bg)
+        wp_wrap.grid_columnconfigure(1, weight=1)
+        wp_wrap.grid_rowconfigure(0, weight=1)
+
+        # Toggle button sits in a narrow column on the left edge of the panel.
+        self.wp_toggle_btn = ctk.CTkButton(
+            wp_wrap, text="\u25b6", width=20, height=40,
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent", hover_color=("gray75", "gray30"),
+            command=self.toggle_waypoint_panel)
+        self.wp_toggle_btn.grid(row=0, column=0, sticky="ns", padx=(2, 0))
+
+        self.waypoint_panel = WaypointPanel(
+            wp_wrap, self.waypoints,
+            on_send=self._send_waypoints_to_boat,
+            on_log=self.append_log)
+        self.waypoint_panel.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
+        self.outer_pane.add(wp_wrap, minsize=40, stretch="always")
+
+        # Default sash positions. Run after geometry settles.
         def _place_sashes():
             hw = self.hpane.winfo_width()
             if hw > 1:
                 self.hpane.sash_place(0, int(hw * 0.40), 0)
+            ow = self.outer_pane.winfo_width()
+            if ow > 1:
+                # Waypoint panel takes ~22% of width by default.
+                self.outer_pane.sash_place(0, int(ow * 0.78), 0)
         self.vpane.after(80, _place_sashes)
+
+    def toggle_waypoint_panel(self):
+        """Collapse or expand the waypoint side panel."""
+        self._wp_panel_collapsed = not self._wp_panel_collapsed
+        if self._wp_panel_collapsed:
+            self._wp_sash_x = self.outer_pane.sash_coord(0)[0]
+            total = self.outer_pane.winfo_width()
+            self.outer_pane.sash_place(0, max(total - 30, 0), 0)
+            self.wp_toggle_btn.configure(text="\u25c0")
+        else:
+            x = self._wp_sash_x
+            if x is None:
+                x = int(self.outer_pane.winfo_width() * 0.78)
+            self.outer_pane.sash_place(0, x, 0)
+            self.wp_toggle_btn.configure(text="\u25b6")
+
+    def _send_waypoints_to_boat(self, json_payload):
+        """Hook for transmitting the waypoint list to the controller.
+
+        Two-way comms isn't wired yet, so log the payload for now. Replace
+        the print with a UART/XBee TX call once that link exists.
+        """
+        self.append_log(f"** TX waypoints: {json_payload} **")
 
     def _build_controller_card(self, parent):
         card = ctk.CTkFrame(parent, corner_radius=10)
@@ -505,6 +568,20 @@ class App(ctk.CTk):
             self.mapview.grid(row=1, column=0, sticky="nsew", padx=10,
                              pady=(0, 12))
             self.mapview.set_zoom(15)
+
+            # Right-click → add waypoint at the clicked map coordinates.
+            try:
+                self.mapview.add_right_click_menu_command(
+                    label="Add waypoint here",
+                    command=self._add_waypoint_from_map,
+                    pass_coords=True)
+            except Exception as e:
+                self.append_log(
+                    f"** Right-click menu unavailable ({e}); "
+                    f"update tkintermapview to add waypoints from the map. **")
+
+            # Attach the waypoint layer; it'll redraw on every store change.
+            self.wp_map_layer = WaypointMapLayer(self.mapview, self.waypoints)
         else:
             ctk.CTkLabel(right, text="Map unavailable.\nInstall it with:\n"
                          "pip install tkintermapview",
@@ -534,6 +611,16 @@ class App(ctk.CTk):
         self.mapview = None
         self.boat_marker = None
         self.wp_marker = None
+        self.breadcrumb_path = None
+        self.wp_map_layer = None
+
+    def _add_waypoint_from_map(self, coords):
+        """Right-click handler on the map: append a new waypoint here."""
+        lat, lon = coords
+        wp = self.waypoints.add(lat, lon)
+        self.append_log(
+            f"** Added waypoint {wp['name']} at "
+            f"{lat:.5f}, {lon:.5f} **")
 
     def _refresh_3d_from_latest(self):
         """Push the most recent telemetry into the 3D view."""
@@ -563,8 +650,13 @@ class App(ctk.CTk):
                     self.boat_marker.set_position(lat, lon)
                 coords = [(p[0], p[1]) for p in self.gps_track[-500:]]
                 if len(coords) > 1:
-                    self.mapview.delete_all_path()
-                    self.mapview.set_path(coords)
+                    # Only delete OUR breadcrumb path, not the waypoint path.
+                    if self.breadcrumb_path is not None:
+                        try:
+                            self.breadcrumb_path.delete()
+                        except Exception:
+                            pass
+                    self.breadcrumb_path = self.mapview.set_path(coords)
             tlat = d.get("tlat")
             tlon = d.get("tlon")
             if (tlat is not None and tlon is not None
