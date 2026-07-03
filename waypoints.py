@@ -120,6 +120,15 @@ class WaypointStore:
                 self._notify(structural=True)
                 return
 
+    def update_position(self, wp_id, lat, lon):
+        """Move a waypoint to new coordinates."""
+        for w in self._items:
+            if w["id"] == wp_id:
+                w["lat"] = float(lat)
+                w["lon"] = float(lon)
+                self._notify(structural=True)
+                return
+
     def move(self, from_index, to_index):
         """Move item at from_index to to_index. Clamps to valid range."""
         if from_index == to_index:
@@ -431,16 +440,44 @@ class WaypointMapLayer:
     Subscribes to the store and rebuilds its markers/paths on every change.
     The boat marker and breadcrumb path are managed elsewhere and aren't
     touched by this class.
+
+    Right-click "Adjust nearest waypoint" enters move mode: the next left
+    click on the map repositions the selected waypoint.
     """
 
-    def __init__(self, mapview, store):
-        self.mapview = mapview
-        self.store   = store
+    # How close (in degrees) a right-click must be to a waypoint to count.
+    _SNAP_THRESHOLD_DEG = 0.01  # ~1 km at mid-latitudes
+
+    def __init__(self, mapview, store, on_log=None):
+        self.mapview  = mapview
+        self.store    = store
+        self.on_log   = on_log or (lambda s: None)
         self._markers = []
-        self._path = None
+        self._path    = None
+
+        # Adjust mode state
+        self._adjusting_id   = None   # wp id being repositioned
+        self._adjusting_name = None
+        self._adjust_label   = None   # overlay prompt label
+
+        # Register two right-click menu commands. "Place waypoint here" only
+        # does anything when a waypoint has been selected for adjustment.
+        try:
+            self.mapview.add_right_click_menu_command(
+                label="Adjust nearest waypoint",
+                command=self._start_adjust,
+                pass_coords=True)
+            self.mapview.add_right_click_menu_command(
+                label="Place waypoint here",
+                command=self._place_adjust,
+                pass_coords=True)
+        except Exception:
+            pass
+
         store.add_listener(self.refresh)
         self.refresh()
 
+    # ----- drawing ----------------------------------------------------- #
     def refresh(self, structural=True):
         # Tear down old markers and path
         for m in self._markers:
@@ -478,3 +515,71 @@ class WaypointMapLayer:
                 self._path = self.mapview.set_path(coords)
             except Exception:
                 self._path = None
+
+    # ----- adjust mode ------------------------------------------------- #
+    def _find_nearest(self, lat, lon):
+        """Return the store item nearest to (lat, lon), or None."""
+        best, best_dist = None, float("inf")
+        for wp in self.store.items():
+            d = (wp["lat"] - lat) ** 2 + (wp["lon"] - lon) ** 2
+            if d < best_dist:
+                best, best_dist = wp, d
+        if best is not None and best_dist ** 0.5 < self._SNAP_THRESHOLD_DEG:
+            return best
+        return None
+
+    def _start_adjust(self, coords):
+        """Right-click → 'Adjust nearest waypoint': select the closest one."""
+        # If already adjusting, cancel the previous selection first.
+        if self._adjusting_id is not None:
+            self._exit_adjust()
+
+        lat, lon = coords
+        nearest = self._find_nearest(lat, lon)
+        if nearest is None:
+            self.on_log("** No waypoint close enough to adjust. "
+                        "Right-click nearer to a marker. **")
+            return
+
+        self._adjusting_id   = nearest["id"]
+        self._adjusting_name = nearest["name"]
+
+        # Show a prompt overlaid on the map.
+        try:
+            import customtkinter as ctk
+            self._adjust_label = ctk.CTkLabel(
+                self.mapview,
+                text=f"  Adjusting {self._adjusting_name}  \u2014  "
+                     f"right-click \u2192 'Place waypoint here'  ",
+                fg_color="#d0a23b", text_color="#1a1a1a", corner_radius=6,
+                font=ctk.CTkFont(size=13, weight="bold"))
+            self._adjust_label.place(relx=0.5, y=10, anchor="n")
+        except Exception:
+            pass
+
+        self.on_log(f"** Selected {self._adjusting_name} for adjustment. "
+                    f"Right-click the new position \u2192 'Place waypoint here'. **")
+
+    def _place_adjust(self, coords):
+        """Right-click → 'Place waypoint here': move the selected waypoint."""
+        if self._adjusting_id is None:
+            self.on_log("** No waypoint selected for adjustment. "
+                        "Use 'Adjust nearest waypoint' first. **")
+            return
+
+        lat, lon = coords
+        name = self._adjusting_name
+        self.store.update_position(self._adjusting_id, lat, lon)
+        self.on_log(f"** Moved {name} to {lat:.5f}, {lon:.5f} **")
+        self._exit_adjust()
+
+    def _exit_adjust(self):
+        """Clear adjust mode state and remove the overlay prompt."""
+        self._adjusting_id = None
+        self._adjusting_name = None
+        if self._adjust_label is not None:
+            try:
+                self._adjust_label.destroy()
+            except Exception:
+                pass
+            self._adjust_label = None

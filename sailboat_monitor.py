@@ -15,6 +15,7 @@ Run:
 """
 
 import queue
+import os
 import threading
 import time
 import tkinter as tk
@@ -41,6 +42,14 @@ from waypoints import (WaypointStore, WaypointPanel, WaypointMapLayer,
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200", "230400", "460800"]
 MAX_LOG_LINES = 200000
 PORT_POLL_MS = 1000  # how often to scan for COM-port hot-plug / unplug
+
+# Map defaults
+DEFAULT_MAP_LAT   = 44.6488     # Halifax, NS
+DEFAULT_MAP_LON   = -63.5752
+DEFAULT_MAP_ZOOM  = 13
+MAP_CACHE_DIR     = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "map_downloads")
+MAP_CACHE_DB      = os.path.join(MAP_CACHE_DIR, "tiles.db")
 
 # The sail is a continuous-rotation drive, not a positional servo: a negative
 # command spins it anti-clockwise (viewed from above), a positive command spins
@@ -559,15 +568,55 @@ class App(ctk.CTk):
         # Right: GPS map
         right = ctk.CTkFrame(paned, corner_radius=10)
         right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(right, text="Position (GPS)",
+        right.grid_rowconfigure(2, weight=1)
+
+        map_head = ctk.CTkFrame(right, fg_color="transparent")
+        map_head.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 4))
+        map_head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(map_head, text="Position (GPS)",
                      font=ctk.CTkFont(size=15, weight="bold")).grid(
-            row=0, column=0, sticky="w", padx=14, pady=(12, 4))
+            row=0, column=0, sticky="w")
+
+        # Tile server picker — lighter servers load faster and use less bandwidth.
+        self._tile_servers = {
+            "CartoDB Voyager": "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+            "OpenStreetMap":   "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            "CartoDB Light":   "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+            "CartoDB Dark":    "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+        }
+        self.tile_combo = ctk.CTkComboBox(
+            map_head, values=list(self._tile_servers.keys()), width=160,
+            command=self._change_tile_server)
+        self.tile_combo.set("CartoDB Voyager")
+        self.tile_combo.grid(row=0, column=1, sticky="e", padx=(0, 6))
+
+        # Refresh button — re-draws waypoint markers and lines. Useful if
+        # the map state gets out of sync after rapid waypoint edits.
+        self.map_refresh_btn = ctk.CTkButton(
+            map_head, text="\u21bb", width=32,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=self._refresh_map)
+        self.map_refresh_btn.grid(row=0, column=2, sticky="e")
+
         if tkintermapview is not None:
-            self.mapview = tkintermapview.TkinterMapView(right, corner_radius=8)
-            self.mapview.grid(row=1, column=0, sticky="nsew", padx=10,
+            default_server = self._tile_servers["CartoDB Voyager"]
+            # Ensure the cache directory exists next to the script.
+            try:
+                os.makedirs(MAP_CACHE_DIR, exist_ok=True)
+            except OSError as e:
+                self.append_log(f"** Could not create map cache dir: {e} **")
+
+            # database_path enables permanent tile caching — tiles download
+            # once, then load from the local SQLite DB on future runs.
+            self.mapview = tkintermapview.TkinterMapView(
+                right, corner_radius=8, database_path=MAP_CACHE_DB)
+            self.mapview.set_tile_server(default_server)
+            self.mapview.grid(row=2, column=0, sticky="nsew", padx=10,
                              pady=(0, 12))
-            self.mapview.set_zoom(15)
+            # Start on Halifax by default. Boat GPS will move the view once
+            # a valid fix comes in.
+            self.mapview.set_position(DEFAULT_MAP_LAT, DEFAULT_MAP_LON)
+            self.mapview.set_zoom(DEFAULT_MAP_ZOOM)
 
             # Right-click → add waypoint at the clicked map coordinates.
             try:
@@ -580,12 +629,14 @@ class App(ctk.CTk):
                     f"** Right-click menu unavailable ({e}); "
                     f"update tkintermapview to add waypoints from the map. **")
 
-            # Attach the waypoint layer; it'll redraw on every store change.
-            self.wp_map_layer = WaypointMapLayer(self.mapview, self.waypoints)
+            # Attach the waypoint layer; it handles markers, connecting lines,
+            # and the "Adjust nearest waypoint" right-click option.
+            self.wp_map_layer = WaypointMapLayer(
+                self.mapview, self.waypoints, on_log=self.append_log)
         else:
             ctk.CTkLabel(right, text="Map unavailable.\nInstall it with:\n"
                          "pip install tkintermapview",
-                         justify="center").grid(row=1, column=0, padx=20,
+                         justify="center").grid(row=2, column=0, padx=20,
                                                 pady=20)
             self.mapview = None
         paned.add(right, minsize=280, stretch="always")
@@ -621,6 +672,23 @@ class App(ctk.CTk):
         self.append_log(
             f"** Added waypoint {wp['name']} at "
             f"{lat:.5f}, {lon:.5f} **")
+
+    def _change_tile_server(self, choice):
+        """Switch the map tile server."""
+        if self.mapview is None:
+            return
+        url = self._tile_servers.get(choice)
+        if url:
+            try:
+                self.mapview.set_tile_server(url)
+            except Exception:
+                pass
+
+    def _refresh_map(self):
+        """Re-draw waypoint markers and connecting lines from the store."""
+        if self.wp_map_layer is not None:
+            self.wp_map_layer.refresh(structural=True)
+            self.append_log("** Map waypoints refreshed. **")
 
     def _refresh_3d_from_latest(self):
         """Push the most recent telemetry into the 3D view."""
