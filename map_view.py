@@ -225,8 +225,8 @@ class MapViewMixin:
                 return
     
             current_zoom = int(self.mapview.zoom)
-            zoom_min = max(0,  current_zoom - 2)
-            zoom_max = min(19, current_zoom + 2)
+            zoom_min = max(0,  current_zoom - 4)
+            zoom_max = min(19, current_zoom + 4)
     
             # Rough estimate of tile count so the user knows what they're asking for.
             lat_span = abs(top_left[0] - bottom_right[0])
@@ -307,4 +307,3 @@ class MapViewMixin:
                         self.wp_marker.set_position(tlat, tlon)
             except Exception:
                 pass  # window may be tearing down as a packet lands
-    
