@@ -97,7 +97,9 @@ The code is split into modules by feature:
 
 | File | What it does |
 |------|--------------|
-| `sailboat_monitor.py` | Main app and window. Run this one. |
+| `sailboat_monitor.py` | Main app and window layout. Run this one. |
+| `connection.py` | Serial connect/disconnect, port scanning, queue pump, telemetry dispatch. |
+| `map_view.py` | 3D view + GPS map window, tile server management, offline tile downloads. |
 | `parsing.py` | Reads the controller and telemetry serial lines, formats values. |
 | `serial_io.py` | Detects ST-Link ports, reads the port in a background thread. |
 | `widgets.py` | 2D gauges, top-down boat view, wind rose, trend plot. |
