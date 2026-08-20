@@ -17,10 +17,13 @@ from waypoints import WaypointMapLayer
 # Map defaults
 DEFAULT_MAP_LAT   = 44.6488     # Halifax, NS
 DEFAULT_MAP_LON   = -63.5752
-DEFAULT_MAP_ZOOM  = 13
+DEFAULT_MAP_ZOOM  = 12
 MAP_CACHE_DIR     = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "map_downloads")
 MAP_CACHE_DB      = os.path.join(MAP_CACHE_DIR, "tiles.db")
+
+OPENSEAMAP_TILE_SERVER = "https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png"
+OPENSEAMAP_MAX_ZOOM = 18
 
 TILE_SERVERS = {
     "CartoDB Voyager": "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
@@ -39,6 +42,13 @@ class MapViewMixin:
                 return
     
             try:
+                # tkintermapview 1.29 still references Image.ANTIALIAS when it
+                # composites overlay tiles. Pillow 10+ removed that name, so
+                # provide the equivalent alias before importing/using the map.
+                from PIL import Image
+                if not hasattr(Image, "ANTIALIAS") and hasattr(Image, "Resampling"):
+                    Image.ANTIALIAS = Image.Resampling.LANCZOS
+
                 import tkintermapview
             except ImportError:
                 self.append_log("** 'tkintermapview' is not installed. Run: "
@@ -89,8 +99,16 @@ class MapViewMixin:
             self.tile_combo = ctk.CTkComboBox(
                 map_head, values=list(TILE_SERVERS.keys()), width=160,
                 command=self._change_tile_server)
-            self.tile_combo.set("CartoDB Voyager")
-            self.tile_combo.grid(row=0, column=1, sticky="e", padx=(0, 6))
+            self.tile_combo.set("OpenStreetMap")
+            self.tile_combo.grid(row=0, column=1, sticky="e", padx=(0, 8))
+
+            # OpenSeaMap seamarks are a transparent XYZ overlay. Keep this as a
+            # separate switch so the base map can still be changed independently.
+            self.nautical_switch = ctk.CTkSwitch(
+                map_head, text="Nautical", width=92,
+                command=self._toggle_nautical_overlay)
+            self.nautical_switch.select()
+            self.nautical_switch.grid(row=0, column=2, sticky="e", padx=(0, 8))
     
             # Refresh button — re-draws waypoint markers and lines. Useful if
             # the map state gets out of sync after rapid waypoint edits.
@@ -98,7 +116,7 @@ class MapViewMixin:
                 map_head, text="\u21bb", width=32,
                 font=ctk.CTkFont(size=14, weight="bold"),
                 command=self._refresh_map)
-            self.map_refresh_btn.grid(row=0, column=2, sticky="e", padx=(0, 6))
+            self.map_refresh_btn.grid(row=0, column=3, sticky="e", padx=(0, 6))
     
             # Download tiles — grabs the visible area at current zoom \u00b1 2
             # levels into the on-disk database so it loads offline next time.
@@ -106,10 +124,10 @@ class MapViewMixin:
                 map_head, text="\u2b07 Save Offline", width=110,
                 font=ctk.CTkFont(size=12),
                 command=self._download_visible_tiles)
-            self.map_download_btn.grid(row=0, column=3, sticky="e")
+            self.map_download_btn.grid(row=0, column=4, sticky="e")
     
             if tkintermapview is not None:
-                default_server = TILE_SERVERS["CartoDB Voyager"]
+                default_server = TILE_SERVERS[self.tile_combo.get()]
                 # Ensure the cache directory exists next to the script.
                 try:
                     os.makedirs(MAP_CACHE_DIR, exist_ok=True)
@@ -120,9 +138,10 @@ class MapViewMixin:
                 # once, then load from the local SQLite DB on future runs.
                 self.mapview = tkintermapview.TkinterMapView(
                     right, corner_radius=8, database_path=MAP_CACHE_DB)
-                self.mapview.set_tile_server(default_server)
+                self.mapview.set_tile_server(default_server, max_zoom = OPENSEAMAP_MAX_ZOOM)
+                self.mapview.set_overlay_tile_server(OPENSEAMAP_TILE_SERVER)
                 self.mapview.grid(row=2, column=0, sticky="nsew", padx=10,
-                                 pady=(0, 12))
+                                 pady=(0, 4))
                 # Start on Halifax by default. Boat GPS will move the view once
                 # a valid fix comes in.
                 self.mapview.set_position(DEFAULT_MAP_LAT, DEFAULT_MAP_LON)
@@ -143,6 +162,15 @@ class MapViewMixin:
                 # and the "Adjust nearest waypoint" right-click option.
                 self.wp_map_layer = WaypointMapLayer(
                     self.mapview, self.waypoints, on_log=self.append_log)
+
+                self.nautical_attribution = ctk.CTkLabel(
+                    right,
+                    text="Nautical data: © OpenStreetMap contributors / OpenSeaMap",
+                    font=ctk.CTkFont(size=9),
+                    text_color=("gray45", "gray60"),
+                    anchor="e")
+                self.nautical_attribution.grid(
+                    row=3, column=0, sticky="e", padx=12, pady=(0, 6))
             else:
                 ctk.CTkLabel(right, text="Map unavailable.\nInstall it with:\n"
                              "pip install tkintermapview",
@@ -184,15 +212,47 @@ class MapViewMixin:
                 f"{lat:.5f}, {lon:.5f} **")
     
         def _change_tile_server(self, choice):
-            """Switch the map tile server."""
+            """Switch the base map while preserving the nautical overlay state."""
             if self.mapview is None:
                 return
             url = TILE_SERVERS.get(choice)
             if url:
                 try:
-                    self.mapview.set_tile_server(url)
-                except Exception:
-                    pass
+                    nautical_on = bool(self.nautical_switch.get())
+                    max_zoom = OPENSEAMAP_MAX_ZOOM if nautical_on else 19
+                    self.mapview.set_tile_server(url, max_zoom=max_zoom)
+                except Exception as e:
+                    self.append_log(f"** Could not change map source: {e} **")
+
+        def _toggle_nautical_overlay(self):
+            """Enable/disable the OpenSeaMap seamark overlay and redraw tiles."""
+            if self.mapview is None:
+                return
+
+            enabled = bool(self.nautical_switch.get())
+            overlay = OPENSEAMAP_TILE_SERVER if enabled else None
+            try:
+                self.mapview.set_overlay_tile_server(overlay)
+
+                # set_overlay_tile_server() only changes the URL. Re-applying
+                # the current base server clears TkinterMapView's in-memory tile
+                # cache so already-visible tiles are immediately recomposited.
+                base_url = TILE_SERVERS.get(
+                    self.tile_combo.get(), TILE_SERVERS["CartoDB Voyager"])
+                max_zoom = OPENSEAMAP_MAX_ZOOM if enabled else 19
+                self.mapview.set_tile_server(base_url, max_zoom=max_zoom)
+
+                if hasattr(self, "nautical_attribution"):
+                    if enabled:
+                        self.nautical_attribution.grid()
+                    else:
+                        self.nautical_attribution.grid_remove()
+
+                self.append_log(
+                    f"** OpenSeaMap nautical overlay "
+                    f"{'enabled' if enabled else 'disabled'}. **")
+            except Exception as e:
+                self.append_log(f"** Could not change nautical overlay: {e} **")
     
         def _refresh_map(self):
             """Re-draw waypoint markers and connecting lines from the store."""
