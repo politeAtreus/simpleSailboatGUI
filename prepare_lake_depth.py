@@ -167,7 +167,7 @@ def main():
         "opacity": opacity,
         "source": "Nova Scotia Fisheries & Aquaculture Lake Inventory",
         "source_url": args.source_url,
-        "notes": "Reference/planning overlay only; not for navigation.",
+        "notes": "Bathymetry may not be accurate.",
     }
     meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
