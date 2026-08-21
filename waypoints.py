@@ -7,6 +7,7 @@ notified.
 
 import itertools
 import json
+import math
 import tkinter as tk
 
 import customtkinter as ctk
@@ -434,34 +435,60 @@ class WaypointPanel(ctk.CTkFrame):
 # Map integration
 # --------------------------------------------------------------------------- #
 
+# Route-depth safety thresholds.  These are deliberately module-level so the
+# map probe and the route renderer use exactly the same values.
+BOAT_DRAFT_M = 2.0
+SAFE_DEPTH_M = 2.5
+
+ROUTE_SAFE_COLOR = "#3b8ed0"       # blue: estimated depth >= SAFE_DEPTH_M
+ROUTE_CAUTION_COLOR = "#e8c43d"    # yellow: BOAT_DRAFT_M .. SAFE_DEPTH_M
+ROUTE_DANGER_COLOR = "#d05b5b"     # red: estimated depth < BOAT_DRAFT_M
+ROUTE_UNKNOWN_COLOR = "#7f8c8d"    # grey: bathymetry enabled, no estimate
+ROUTE_DEPTH_SAMPLE_M = 1.0          # route is depth-tested about every 3 m
+ROUTE_LINE_WIDTH = 5
+
+
 class WaypointMapLayer:
-    """Draws waypoints and connecting lines on a tkintermapview map.
+    """Draw waypoints and a depth-aware route on a TkinterMapView map.
 
-    Subscribes to the store and rebuilds its markers/paths on every change.
-    The boat marker and breadcrumb path are managed elsewhere and aren't
-    touched by this class.
+    When a lake-depth layer is active, each waypoint leg is sampled at roughly
+    ``ROUTE_DEPTH_SAMPLE_M`` spacing.  Only the local part of the route that is
+    shallow changes colour:
 
-    Right-click "Adjust nearest waypoint" enters move mode: the next left
-    click on the map repositions the selected waypoint.
+        blue   >= SAFE_DEPTH_M
+        yellow BOAT_DRAFT_M .. SAFE_DEPTH_M
+        red    < BOAT_DRAFT_M
+        grey   no usable depth estimate
+
+    This means one route can naturally transition blue -> yellow -> red ->
+    yellow -> blue as it crosses a shoal.  The bathymetry layer supplies the
+    approximate numeric depth; this class only handles route sampling and
+    safety colouring.
+
+    Right-click "Adjust nearest waypoint" enters move mode.  The next
+    right-click "Place waypoint here" repositions the selected waypoint.
     """
 
-    # How close (in degrees) a right-click must be to a waypoint to count.
     _SNAP_THRESHOLD_DEG = 0.01  # ~1 km at mid-latitudes
 
     def __init__(self, mapview, store, on_log=None):
-        self.mapview  = mapview
-        self.store    = store
-        self.on_log   = on_log or (lambda s: None)
+        self.mapview = mapview
+        self.store = store
+        self.on_log = on_log or (lambda s: None)
         self._markers = []
-        self._path    = None
+        self._paths = []
+
+        # Re-use expensive depth sampling when only waypoint status colours
+        # changed.  Structural waypoint edits or a different bathymetry layer
+        # naturally produce a different signature.
+        self._route_cache_signature = None
+        self._route_cache_runs = []
 
         # Adjust mode state
-        self._adjusting_id   = None   # wp id being repositioned
+        self._adjusting_id = None
         self._adjusting_name = None
-        self._adjust_label   = None   # overlay prompt label
+        self._adjust_label = None
 
-        # Register two right-click menu commands. "Place waypoint here" only
-        # does anything when a waypoint has been selected for adjustment.
         try:
             self.mapview.add_right_click_menu_command(
                 label="Adjust nearest waypoint",
@@ -479,42 +506,144 @@ class WaypointMapLayer:
 
     # ----- drawing ----------------------------------------------------- #
     def refresh(self, structural=True):
-        # Tear down old markers and path
-        for m in self._markers:
+        """Rebuild waypoint markers and the depth-coloured route."""
+        for marker in self._markers:
             try:
-                m.delete()
+                marker.delete()
             except Exception:
                 pass
         self._markers = []
-        if self._path is not None:
+
+        for path in self._paths:
             try:
-                self._path.delete()
+                path.delete()
             except Exception:
                 pass
-            self._path = None
+        self._paths = []
 
         items = self.store.items()
         if not items:
             return
 
-        # Place numbered markers
         for i, wp in enumerate(items, start=1):
             try:
                 marker = self.mapview.set_marker(
                     wp["lat"], wp["lon"], text=f"{i}. {wp['name']}",
-                    marker_color_circle=_DOT_COLORS.get(wp["status"], "#ffffff"),
+                    marker_color_circle=_DOT_COLORS.get(
+                        wp["status"], "#ffffff"),
                     marker_color_outside="#444")
                 self._markers.append(marker)
             except Exception:
                 pass
 
-        # Connect them with a path in list order
         if len(items) >= 2:
+            self._draw_depth_route(items)
+
+    @staticmethod
+    def _distance_m(a, b):
+        """Great-circle distance between two (lat, lon) points in metres."""
+        lat1, lon1 = a
+        lat2, lon2 = b
+        r = 6371000.0
+        p1 = math.radians(lat1)
+        p2 = math.radians(lat2)
+        dp = math.radians(lat2 - lat1)
+        dl = math.radians(lon2 - lon1)
+        h = (math.sin(dp / 2.0) ** 2 +
+             math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2)
+        return 2.0 * r * math.asin(min(1.0, math.sqrt(h)))
+
+    @staticmethod
+    def _lerp_position(a, b, t):
+        """Linear lat/lon interpolation, sufficient over individual lake legs."""
+        return (a[0] + (b[0] - a[0]) * t,
+                a[1] + (b[1] - a[1]) * t)
+
+    @staticmethod
+    def _colour_for_depth(depth_m):
+        if depth_m < BOAT_DRAFT_M:
+            return ROUTE_DANGER_COLOR
+        if depth_m < SAFE_DEPTH_M:
+            return ROUTE_CAUTION_COLOR
+        return ROUTE_SAFE_COLOR
+
+    def _depth_estimate(self, lat, lon):
+        provider = getattr(self.mapview, "depth_estimate_at", None)
+        if provider is None:
+            return None
+        try:
+            return provider(lat, lon)
+        except Exception:
+            return None
+
+    def _route_signature(self, items):
+        coords = tuple((round(w["lat"], 8), round(w["lon"], 8)) for w in items)
+        layer = getattr(self.mapview, "depth_layer", None)
+        layer_id = getattr(layer, "cache_id", None) if layer is not None else None
+        return coords, layer_id
+
+    def _build_route_runs(self, items):
+        """Return [(colour, [coords...]), ...] for the complete route."""
+        depth_active = getattr(self.mapview, "depth_layer", None) is not None
+        runs = []
+        current_colour = None
+        current_coords = []
+
+        def append_segment(p0, p1, colour):
+            nonlocal current_colour, current_coords
+            if current_colour == colour and current_coords:
+                if current_coords[-1] != p0:
+                    current_coords.append(p0)
+                current_coords.append(p1)
+                return
+            if current_coords and len(current_coords) >= 2:
+                runs.append((current_colour, current_coords))
+            current_colour = colour
+            current_coords = [p0, p1]
+
+        for wp_a, wp_b in zip(items, items[1:]):
+            a = (float(wp_a["lat"]), float(wp_a["lon"]))
+            b = (float(wp_b["lat"]), float(wp_b["lon"]))
+            leg_m = self._distance_m(a, b)
+            pieces = max(1, int(math.ceil(leg_m / ROUTE_DEPTH_SAMPLE_M)))
+
+            for i in range(pieces):
+                p0 = self._lerp_position(a, b, i / pieces)
+                p1 = self._lerp_position(a, b, (i + 1) / pieces)
+
+                if not depth_active:
+                    colour = ROUTE_SAFE_COLOR
+                else:
+                    mid = self._lerp_position(p0, p1, 0.5)
+                    estimate = self._depth_estimate(*mid)
+                    if estimate is None:
+                        colour = ROUTE_UNKNOWN_COLOR
+                    else:
+                        colour = self._colour_for_depth(
+                            float(estimate["depth_m"]))
+
+                append_segment(p0, p1, colour)
+
+        if current_coords and len(current_coords) >= 2:
+            runs.append((current_colour, current_coords))
+        return runs
+
+    def _draw_depth_route(self, items):
+        signature = self._route_signature(items)
+        if signature == self._route_cache_signature:
+            runs = self._route_cache_runs
+        else:
+            runs = self._build_route_runs(items)
+            self._route_cache_signature = signature
+            self._route_cache_runs = runs
+
+        for colour, coords in runs:
             try:
-                coords = [(w["lat"], w["lon"]) for w in items]
-                self._path = self.mapview.set_path(coords)
+                path = self.mapview.set_path(
+                    coords, color=colour, width=ROUTE_LINE_WIDTH)
+                self._paths.append(path)
             except Exception:
-                self._path = None
+                pass
 
     # ----- adjust mode ------------------------------------------------- #
     def _find_nearest(self, lat, lon):
@@ -529,8 +658,7 @@ class WaypointMapLayer:
         return None
 
     def _start_adjust(self, coords):
-        """Right-click → 'Adjust nearest waypoint': select the closest one."""
-        # If already adjusting, cancel the previous selection first.
+        """Right-click -> 'Adjust nearest waypoint': select the closest one."""
         if self._adjusting_id is not None:
             self._exit_adjust()
 
@@ -541,16 +669,15 @@ class WaypointMapLayer:
                         "Right-click nearer to a marker. **")
             return
 
-        self._adjusting_id   = nearest["id"]
+        self._adjusting_id = nearest["id"]
         self._adjusting_name = nearest["name"]
 
-        # Show a prompt overlaid on the map.
         try:
             import customtkinter as ctk
             self._adjust_label = ctk.CTkLabel(
                 self.mapview,
-                text=f"  Adjusting {self._adjusting_name}  \u2014  "
-                     f"right-click \u2192 'Place waypoint here'  ",
+                text=f"  Adjusting {self._adjusting_name}  -  "
+                     f"right-click -> 'Place waypoint here'  ",
                 fg_color="#d0a23b", text_color="#1a1a1a", corner_radius=6,
                 font=ctk.CTkFont(size=13, weight="bold"))
             self._adjust_label.place(relx=0.5, y=10, anchor="n")
@@ -558,10 +685,10 @@ class WaypointMapLayer:
             pass
 
         self.on_log(f"** Selected {self._adjusting_name} for adjustment. "
-                    f"Right-click the new position \u2192 'Place waypoint here'. **")
+                    f"Right-click the new position -> 'Place waypoint here'. **")
 
     def _place_adjust(self, coords):
-        """Right-click → 'Place waypoint here': move the selected waypoint."""
+        """Right-click -> 'Place waypoint here': move the selected waypoint."""
         if self._adjusting_id is None:
             self.on_log("** No waypoint selected for adjustment. "
                         "Use 'Adjust nearest waypoint' first. **")

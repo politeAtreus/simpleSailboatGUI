@@ -127,6 +127,15 @@ def main():
                         help="Default GUI opacity, 0..1 (default: 0.72)")
     parser.add_argument("--preferred-zoom", type=int, default=15,
                         help="Zoom selected when this lake is enabled")
+    parser.add_argument(
+        "--depth-contours", nargs="+", type=float, default=[1.0, 3.0, 5.0],
+        metavar="M",
+        help=("Labelled bathymetry contour depths in metres, shallow to deep "
+              "(default: 1 3 5). These drive numeric depth interpolation."))
+    parser.add_argument(
+        "--depth-error", type=float, default=0.75,
+        help=("Nominal +/- uncertainty for interpolated depths in metres "
+              "(default: 0.75)"))
     parser.add_argument("--source-url", default="",
                         help="Official source PDF URL stored in metadata")
     parser.add_argument(
@@ -142,6 +151,10 @@ def main():
 
     opacity = max(0.05, min(1.0, float(args.opacity)))
     preferred_zoom = max(1, min(19, int(args.preferred_zoom)))
+    depth_contours = sorted({float(v) for v in args.depth_contours if v > 0.0})
+    if not depth_contours:
+        raise SystemExit("--depth-contours must contain at least one positive depth")
+    depth_error = max(0.1, float(args.depth_error))
 
     img = load_source(args.input, dpi=args.dpi)
     img = crop_image(img, args.crop)
@@ -165,6 +178,11 @@ def main():
         },
         "preferred_zoom": preferred_zoom,
         "opacity": opacity,
+        "depth_contours_m": depth_contours,
+        "depth_uncertainty_m": depth_error,
+        "depth_estimation": (
+            "Approximate raster-derived interpolation between labelled contours; "
+            "not survey-grade navigation data."),
         "source": "Nova Scotia Fisheries & Aquaculture Lake Inventory",
         "source_url": args.source_url,
         "notes": "Bathymetry may not be accurate.",
@@ -174,6 +192,8 @@ def main():
     print(f"Prepared: {args.name}")
     print(f"  image:    {image_path}")
     print(f"  metadata: {meta_path}")
+    print("  depth contours (m): " + ", ".join(f"{v:g}" for v in depth_contours))
+    print(f"  nominal depth error: +/- {depth_error:g} m")
     print("Use the map window's Lake depth -> Reload button to pick it up.")
 
 
