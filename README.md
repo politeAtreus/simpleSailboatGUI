@@ -200,24 +200,29 @@ A couple of constants near the top of `sailboat_monitor.py` you may want to adju
 
 ## Bathymetry and waypoint route safety
 
-The map window can use locally prepared Nova Scotia Lake Inventory contour maps as
-bathymetry overlays. The overlay is still the source of truth; the program derives an
-**approximate** numeric depth field from the visible contour bands so it can query and
-colour routes. This is not survey-grade or sonar data.
+The visual Nova Scotia Lake Inventory overlay and the numeric depth source are now
+separate. The GUI does **not** inspect contour lines or try to infer depths from the
+overlay image. Numeric queries come only from a precomputed static file:
+
+```text
+lake_depth_maps/<Lake Name>/depth_grid.npz
+```
+
+Lake Micmac and Lake Charles are supplied with 1 m grid-spacing depth maps prepared
+from the corresponding inventory PDFs. The 1 m value is the **cell spacing**, not the
+measurement accuracy; the depth values remain approximate historical-map estimates.
 
 - Enable a prepared lake with **Lake depth** in the 3D/GPS map window.
-- Right-click the map and choose **Approx. water depth here (±)** to place a depth
-  marker such as `Depth ≈ 2.2 ± 0.8 m`.
+- Right-click and choose **Approx. water depth here (±)** to query the static grid.
 - Waypoint legs are sampled at about 1 m intervals and only the local route sections
   change colour:
   - blue: estimated depth >= 2.5 m
   - yellow: 2.0 m <= estimated depth < 2.5 m
   - red: estimated depth < 2.0 m boat draft
-  - grey: the active bathymetry raster cannot provide an estimate there
-- The current constants are `BOAT_DRAFT_M = 2.0` and `SAFE_DEPTH_M = 2.5` near the
-  map-integration section of `waypoints.py`.
+  - grey: no grid value exists at that position
+- `BOAT_DRAFT_M = 2.0` and `SAFE_DEPTH_M = 2.5` are defined in `waypoints.py`.
 
-`prepare_lake_depth.py` writes the contour depths and nominal uncertainty into each
-lake's `metadata.json`. The defaults are 1/3/5 m contours with ±0.75 m uncertainty;
-use `--depth-contours` and `--depth-error` when a particular inventory sheet uses
-other labelled depths.
+Each custom grid contains its own geographic bounds, spacing and nominal uncertainty.
+`prepare_lake_depth.py` now prepares only the visual overlay; it does not perform OCR,
+contour detection or depth interpolation.
+

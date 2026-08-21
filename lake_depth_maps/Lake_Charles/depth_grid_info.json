@@ -1,0 +1,24 @@
+{
+  "name": "Lake Charles",
+  "file": "depth_grid.npz",
+  "grid_spacing_m": 1.0,
+  "uncertainty_m": 1.0,
+  "bounds": {
+    "north": 44.7393449614369,
+    "south": 44.70776746937959,
+    "west": -63.55839599407135,
+    "east": -63.54379224340077
+  },
+  "shape": {
+    "rows": 3517,
+    "cols": 1157
+  },
+  "source_pdf": "3-H-charles.pdf",
+  "source_page": 1,
+  "notes": [
+    "Static approximate depth grid prepared from the supplied lake inventory PDF.",
+    "1 m is the grid cell spacing, not 1 m measurement accuracy.",
+    "NaN cells are land/outside the mapped lake.",
+    "Not survey-grade or suitable as a sole source for navigation."
+  ]
+}

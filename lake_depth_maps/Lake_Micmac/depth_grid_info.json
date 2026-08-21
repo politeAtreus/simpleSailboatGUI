@@ -1,0 +1,24 @@
+{
+  "name": "Lake Micmac",
+  "file": "depth_grid.npz",
+  "grid_spacing_m": 1.0,
+  "uncertainty_m": 1.0,
+  "bounds": {
+    "north": 44.700126118392824,
+    "south": 44.68348695382929,
+    "west": -63.56305405835046,
+    "east": -63.54564471157764
+  },
+  "shape": {
+    "rows": 1854,
+    "cols": 1379
+  },
+  "source_pdf": "3-H-micmac.pdf",
+  "source_page": 1,
+  "notes": [
+    "Static approximate depth grid prepared from the supplied lake inventory PDF.",
+    "1 m is the grid cell spacing, not 1 m measurement accuracy.",
+    "NaN cells are land/outside the mapped lake.",
+    "Not survey-grade or suitable as a sole source for navigation."
+  ]
+}

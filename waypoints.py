@@ -444,7 +444,7 @@ ROUTE_SAFE_COLOR = "#3b8ed0"       # blue: estimated depth >= SAFE_DEPTH_M
 ROUTE_CAUTION_COLOR = "#e8c43d"    # yellow: BOAT_DRAFT_M .. SAFE_DEPTH_M
 ROUTE_DANGER_COLOR = "#d05b5b"     # red: estimated depth < BOAT_DRAFT_M
 ROUTE_UNKNOWN_COLOR = "#7f8c8d"    # grey: bathymetry enabled, no estimate
-ROUTE_DEPTH_SAMPLE_M = 1.0          # route is depth-tested about every 3 m
+ROUTE_DEPTH_SAMPLE_M = 1.0          # route is depth-tested about every 1 m
 ROUTE_LINE_WIDTH = 5
 
 

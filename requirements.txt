@@ -26,4 +26,3 @@ requests==2.34.2
 six==1.17.0
 tkintermapview==1.29
 urllib3==2.7.0
-opencv-python-headless==4.13.0.92

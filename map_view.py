@@ -232,29 +232,9 @@ class LakeDepthRaster:
             meta.get("opacity", LAKE_DEPTH_DEFAULT_OPACITY))
         self.default_opacity = max(0.05, min(1.0, self.default_opacity))
 
-        # The old Nova Scotia inventory sheets used a small set of labelled
-        # isobaths rather than a numeric DEM.  Existing prepared lake packages
-        # therefore default to the common 1/3/5 m contour set, but every lake
-        # can override it in metadata.json with "depth_contours_m".
-        raw_levels = meta.get("depth_contours_m", [1.0, 3.0, 5.0])
-        try:
-            levels = sorted({float(v) for v in raw_levels if float(v) > 0.0})
-        except (TypeError, ValueError):
-            levels = [1.0, 3.0, 5.0]
-        self.depth_contours_m = tuple(levels or [1.0, 3.0, 5.0])
-        self.depth_uncertainty_m = max(
-            0.1, float(meta.get("depth_uncertainty_m", 0.75)))
-        # Depth interpolation is performed on a reduced raster so route
-        # sampling stays cheap even when the source map was rendered at high
-        # DPI.  These can be overridden per lake if an unusually noisy scan
-        # needs more/less contour-gap repair.
-        self.depth_model_max_px = max(400, int(meta.get("depth_model_max_px", 900)))
-        self.depth_close_px = max(3, int(meta.get("depth_close_px", 7)))
-        if self.depth_close_px % 2 == 0:
-            self.depth_close_px += 1
-
-        # Similarity transform.  rotation_deg uses ordinary map orientation:
-        # positive = counter-clockwise, negative = clockwise.
+        # Similarity transform for the visual PDF overlay. Numeric depth grids
+        # are already stored north-up in geographic coordinates, but the image
+        # overlay still uses this calibration when rendered into XYZ tiles.
         self.transform_scale = float(transform.get("scale", 1.0))
         if self.transform_scale <= 0:
             raise ValueError("lake-depth transform scale must be > 0")
@@ -277,7 +257,7 @@ class LakeDepthRaster:
         self._tile_cache = {}
         self._tile_cache_lock = threading.Lock()
 
-        # Axis-aligned *pre-transform* raster bounds in Web-Mercator.
+        # Axis-aligned pre-transform raster bounds in Web-Mercator.
         self._wx0 = _webmercator_x(self.west)
         self._wx1 = _webmercator_x(self.east)
         self._wy0 = _webmercator_y(self.north)
@@ -285,24 +265,32 @@ class LakeDepthRaster:
         self._layer_wx = self._wx1 - self._wx0
         self._layer_wy = self._wy1 - self._wy0
 
-        # Build a lightweight image-derived depth model once per lake.  It
-        # identifies the shoreline and contour-line connected components in
-        # the transparent overlay.  Numeric depth queries then interpolate
-        # between the labelled contour levels rather than pretending the scan
-        # is an accurate sonar/DEM product.
-        self._depth_query_cache = {}
-        self._depth_query_cache_limit = 12000
-        self._depth_model_ready = False
-        self._depth_model_error = None
-        self._build_depth_estimator()
+        # Numeric depth values come from a precomputed static grid stored next
+        # to the visual overlay.  The GUI never tries to interpret contour ink.
+        # This keeps runtime behaviour deterministic and makes the depth data
+        # easy to inspect/replace without changing application code.
+        self.depth_grid_name = str(meta.get("depth_grid", "depth_grid.npz"))
+        self.depth_grid_path = os.path.join(self.package_dir, self.depth_grid_name)
+        self.depth_grid = None
+        self.depth_grid_spacing_m = None
+        self.depth_uncertainty_m = max(
+            0.1, float(meta.get("depth_uncertainty_m", 1.0)))
+        self._depth_grid_ready = False
+        self._depth_grid_error = None
+        self._load_depth_grid()
 
         # A stable identity for the composite RAM cache.  Transform values are
         # included so changing calibration immediately creates a fresh variant.
         stat_img = os.stat(self.image_path)
         stat_meta = os.stat(self.metadata_path)
+        if os.path.isfile(self.depth_grid_path):
+            stat_grid = os.stat(self.depth_grid_path)
+            grid_identity = (stat_grid.st_mtime_ns, stat_grid.st_size)
+        else:
+            grid_identity = None
         self.cache_id = (
             self.name, self.image_path, stat_img.st_mtime_ns, stat_img.st_size,
-            stat_meta.st_mtime_ns, stat_meta.st_size,
+            stat_meta.st_mtime_ns, stat_meta.st_size, grid_identity,
             round(self.anchor_lat, 8), round(self.anchor_lon, 8),
             round(self.transform_scale, 8), round(self.rotation_deg, 8),
             round(self.north, 8), round(self.south, 8),
@@ -352,332 +340,120 @@ class LakeDepthRaster:
         return sx, sy
 
     # ------------------------------------------------------------------ #
-    # Approximate numeric bathymetry derived from the contour raster
+    # Static numeric bathymetry grid
     # ------------------------------------------------------------------ #
 
-    def _build_depth_estimator(self):
-        """Build an approximate depth-zone raster from the scanned contours.
+    def _load_depth_grid(self):
+        """Load a precomputed north-up depth grid from ``depth_grid.npz``.
 
-        The source is a transparent overlay, not a numeric bathymetric DEM.
-        Instead of trying to identify each contour as one connected polyline
-        (which is unreliable when old scanned ink touches labels/shorelines),
-        this routine treats the *transparent water bands between ink lines* as
-        regions.  A small morphological close repairs breaks in old contour
-        lines, then a region-adjacency graph counts how many ink boundaries
-        separate each water region from the outside of the lake.
+        Required NPZ fields:
+            depth_m       2-D float array; NaN means land/unmapped
+            north/south/west/east
 
-        Graph distance 1 is the first water band (shore..first contour),
-        distance 2 is the next band, etc.  For the important 1--3 m band we
-        also precompute distances to the shallower/deeper neighboring bands,
-        allowing a smooth interpolation through 2.0 and 2.5 m instead of one
-        colour for the entire band.
+        Optional fields:
+            spacing_m
+            uncertainty_m
+
+        No contour detection, OCR or image analysis is performed here.
         """
-        try:
-            import cv2
-            import numpy as np
-            from collections import defaultdict, deque
-        except ImportError:
-            self._depth_model_error = (
-                "opencv-python-headless is required for depth interpolation")
+        if not os.path.isfile(self.depth_grid_path):
+            self._depth_grid_error = f"missing {self.depth_grid_name}"
             return
 
         try:
-            rgba = np.asarray(self.image, dtype=np.uint8)
-            alpha = rgba[:, :, 3]
-            src_h, src_w = alpha.shape
-            if int((alpha >= 48).sum()) < 100:
-                self._depth_model_error = "not enough contour ink in overlay"
-                return
+            import numpy as np
 
-            # Work on a bounded-size model. INTER_AREA keeps thin scan ink
-            # visible while reducing a 200-DPI sheet to a fast query grid.
-            scale = min(1.0, float(self.depth_model_max_px) / max(src_w, src_h))
-            model_w = max(64, int(round(src_w * scale)))
-            model_h = max(64, int(round(src_h * scale)))
-            if model_w != src_w or model_h != src_h:
-                alpha_model = cv2.resize(
-                    alpha, (model_w, model_h), interpolation=cv2.INTER_AREA)
-            else:
-                alpha_model = alpha
+            with np.load(self.depth_grid_path, allow_pickle=False) as data:
+                depth = np.asarray(data["depth_m"], dtype=np.float32)
+                if depth.ndim != 2 or depth.shape[0] < 2 or depth.shape[1] < 2:
+                    raise ValueError("depth_m must be a 2-D grid of at least 2x2")
 
-            ink = (alpha_model >= 40).astype(np.uint8)
+                north = float(data["north"])
+                south = float(data["south"])
+                west = float(data["west"])
+                east = float(data["east"])
+                if not (north > south and east > west):
+                    raise ValueError("invalid depth-grid geographic bounds")
 
-            # Repair small line breaks caused by antialiasing / labels printed
-            # through contours.  The kernel is intentionally small relative to
-            # the model so nearby distinct isobaths are not fused together.
-            k = self.depth_close_px
-            close_kernel = np.ones((k, k), dtype=np.uint8)
-            ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, close_kernel)
-            ink = cv2.dilate(
-                ink, np.ones((3, 3), dtype=np.uint8), iterations=1)
+                self.depth_grid = depth
+                self.depth_grid_north = north
+                self.depth_grid_south = south
+                self.depth_grid_west = west
+                self.depth_grid_east = east
 
-            transparent = (ink == 0).astype(np.uint8)
-            count, regions, stats, _ = cv2.connectedComponentsWithStats(
-                transparent, connectivity=8)
-            if count <= 2:
-                self._depth_model_error = "could not separate lake contour bands"
-                return
+                if "spacing_m" in data.files:
+                    self.depth_grid_spacing_m = float(data["spacing_m"])
+                if "uncertainty_m" in data.files:
+                    self.depth_uncertainty_m = max(
+                        0.1, float(data["uncertainty_m"]))
 
-            # Largest transparent component is the paper/map area outside the
-            # closed shoreline in a correctly cropped lake sheet.
-            outside_label = max(
-                range(1, count), key=lambda i: int(stats[i, cv2.CC_STAT_AREA]))
-
-            # Ignore tiny transparent holes inside letters/symbols.  They are
-            # common on inventory sheets and otherwise create false graph hops.
-            model_area = model_w * model_h
-            min_region_area = max(20, int(round(model_area * 0.00002)))
-            valid_labels = {
-                i for i in range(1, count)
-                if int(stats[i, cv2.CC_STAT_AREA]) >= min_region_area
-            }
-            valid_labels.add(outside_label)
-
-            graph = defaultdict(set)
-            max_bridge = max(5, min(15, k + 5))
-            directions = ((1, 0), (0, 1), (1, 1), (1, -1))
-            label_base = int(regions.max()) + 1
-
-            # Two transparent regions are adjacent only when every pixel
-            # directly between them is ink.  This avoids accidentally jumping
-            # across an entire water band and counts one repaired contour line
-            # per graph edge.
-            for ux, uy in directions:
-                for distance in range(2, max_bridge + 1):
-                    dx, dy = ux * distance, uy * distance
-                    x0, x1 = max(0, -dx), min(model_w, model_w - dx)
-                    y0, y1 = max(0, -dy), min(model_h, model_h - dy)
-                    if x1 <= x0 or y1 <= y0:
-                        continue
-
-                    a = regions[y0:y1, x0:x1]
-                    b = regions[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
-                    mask = (a > 0) & (b > 0) & (a != b)
-                    if not mask.any():
-                        continue
-
-                    for offset in range(1, distance):
-                        between = ink[
-                            y0 + uy * offset:y1 + uy * offset,
-                            x0 + ux * offset:x1 + ux * offset]
-                        mask &= between > 0
-                        if not mask.any():
-                            break
-                    if not mask.any():
-                        continue
-
-                    aa = a[mask].astype(np.int64)
-                    bb = b[mask].astype(np.int64)
-                    encoded = (
-                        np.minimum(aa, bb) * label_base + np.maximum(aa, bb))
-                    for value in np.unique(encoded):
-                        left = int(value // label_base)
-                        right = int(value % label_base)
-                        if left in valid_labels and right in valid_labels:
-                            graph[left].add(right)
-                            graph[right].add(left)
-
-            distances = {outside_label: 0}
-            queue = deque([outside_label])
-            while queue:
-                current = queue.popleft()
-                for neighbor in graph.get(current, ()):
-                    if neighbor not in distances:
-                        distances[neighbor] = distances[current] + 1
-                        queue.append(neighbor)
-
-            if len(distances) < 2:
-                self._depth_model_error = "shoreline was not recovered as a closed boundary"
-                return
-
-            # Sentinel values:
-            #   -32768 = ink / unresolved tiny region
-            #       -1 = outside shoreline
-            #        0 = shore..first isobath
-            #        1 = first..second isobath, etc.
-            sentinel = np.int16(-32768)
-            zone_map = np.full(regions.shape, sentinel, dtype=np.int16)
-            for label, graph_distance in distances.items():
-                if graph_distance == 0:
-                    zone = -1
-                else:
-                    zone = graph_distance - 1
-                zone_map[regions == label] = np.int16(zone)
-
-            if not np.any(zone_map >= 0):
-                self._depth_model_error = "no enclosed lake-water region found"
-                return
-
-            # Smooth interpolation in the first-to-second contour band. With
-            # the default 1/3/5 m contours, zone 1 spans 1..3 m and therefore
-            # contains both requested safety thresholds (2.0 and 2.5 m).
-            self._depth_zone1_to_shallow = None
-            self._depth_zone1_to_deep = None
-            if np.any(zone_map == 1):
-                shallow_target = zone_map == 0
-                deep_target = zone_map >= 2
-                if shallow_target.any():
-                    self._depth_zone1_to_shallow = cv2.distanceTransform(
-                        (~shallow_target).astype(np.uint8), cv2.DIST_L2, 3)
-                if deep_target.any():
-                    self._depth_zone1_to_deep = cv2.distanceTransform(
-                        (~deep_target).astype(np.uint8), cv2.DIST_L2, 3)
-
-            self._depth_zone_map = zone_map
-            self._depth_zone_sentinel = int(sentinel)
-            self._depth_model_width = model_w
-            self._depth_model_height = model_h
-            self._depth_model_scale_x = model_w / float(src_w)
-            self._depth_model_scale_y = model_h / float(src_h)
-            self._depth_max_zone = int(zone_map[zone_map >= 0].max())
-            self._depth_region_count = len(distances) - 1
-            self._depth_model_ready = True
-            self._depth_model_error = None
+            self._depth_grid_ready = True
+            self._depth_grid_error = None
         except Exception as exc:
-            self._depth_model_error = str(exc)
-            self._depth_model_ready = False
-
-    def _source_pixel_for_latlon(self, lat, lon):
-        """Map calibrated geographic coordinates back to overlay pixels."""
-        wx_out = _webmercator_x(lon)
-        wy_out = _webmercator_y(lat)
-        wx_src, wy_src = self._inverse_transform(wx_out, wy_out)
-        src_w, src_h = self.image.size
-        sx = (wx_src - self._wx0) / self._layer_wx * src_w
-        sy = (wy_src - self._wy0) / self._layer_wy * src_h
-        return sx, sy
-
-    def _zone_at_model_pixel(self, mx, my):
-        """Resolve model zone at a pixel, including points on contour ink."""
-        import numpy as np
-
-        zone = int(self._depth_zone_map[my, mx])
-        if zone != self._depth_zone_sentinel:
-            return zone, None
-
-        # A click/route sample can land exactly on a several-pixel-wide contour.
-        # Look immediately around it. If two adjacent water zones surround the
-        # ink, this is the shared labelled contour and its depth is known.
-        h, w = self._depth_zone_map.shape
-        for radius in range(1, 7):
-            x0, x1 = max(0, mx - radius), min(w, mx + radius + 1)
-            y0, y1 = max(0, my - radius), min(h, my + radius + 1)
-            values = self._depth_zone_map[y0:y1, x0:x1]
-            valid = values[(values >= 0)]
-            if valid.size == 0:
-                continue
-            zones = sorted({int(v) for v in valid.tolist()})
-            for shallow in zones:
-                if shallow + 1 in zones:
-                    # Boundary between zone N and N+1 is contour level N.
-                    if shallow < len(self.depth_contours_m):
-                        return shallow, float(self.depth_contours_m[shallow])
-            # No clear two-sided contour (often annotation ink). Use the local
-            # modal water zone rather than returning a fabricated boundary.
-            vals, counts = np.unique(valid, return_counts=True)
-            return int(vals[int(np.argmax(counts))]), None
-        return None, None
-
-    def _depth_zone_bounds(self, contour_count):
-        """Depth bounds for a zone after crossing contour_count isobaths."""
-        levels = self.depth_contours_m
-        contour_count = max(0, int(contour_count))
-        if contour_count == 0:
-            return 0.0, levels[0]
-        if contour_count < len(levels):
-            return levels[contour_count - 1], levels[contour_count]
-
-        # Deeper than the deepest labelled contour: extrapolate by the last
-        # observed contour spacing.  This is intentionally marked less certain.
-        if len(levels) >= 2:
-            step = levels[-1] - levels[-2]
-        else:
-            step = levels[-1]
-        step = max(0.5, float(step))
-        lower = levels[-1] + (contour_count - len(levels)) * step
-        return lower, lower + step
+            self.depth_grid = None
+            self._depth_grid_ready = False
+            self._depth_grid_error = str(exc)
 
     def depth_at(self, lat, lon):
-        """Return an approximate raster-derived water depth at ``(lat, lon)``.
+        """Return bilinearly interpolated depth from the static grid.
 
-        Returns ``None`` outside the recovered lake-water regions. Otherwise
-        returns a dict containing ``depth_m`` and ``uncertainty_m``. The value
-        is explicitly an estimate derived from historical contour-map ink; it
-        must not be treated as survey/sonar-grade navigation data.
+        Returns ``None`` outside the grid or over land/unmapped cells.
+        ``depth_m`` is an approximate value from the prepared PDF-derived grid;
+        ``uncertainty_m`` is the nominal error assigned to that lake package.
         """
-        if not self._depth_model_ready:
+        if not self._depth_grid_ready or self.depth_grid is None:
             return None
 
-        sx, sy = self._source_pixel_for_latlon(float(lat), float(lon))
-        src_w, src_h = self.image.size
-        if not (0.0 <= sx < src_w and 0.0 <= sy < src_h):
+        lat = float(lat)
+        lon = float(lon)
+        if not (self.depth_grid_south <= lat <= self.depth_grid_north and
+                self.depth_grid_west <= lon <= self.depth_grid_east):
             return None
 
-        mx = max(0, min(
-            self._depth_model_width - 1,
-            int(round(sx * self._depth_model_scale_x))))
-        my = max(0, min(
-            self._depth_model_height - 1,
-            int(round(sy * self._depth_model_scale_y))))
+        import numpy as np
 
-        key = (mx, my)
-        cached = self._depth_query_cache.get(key)
-        if cached is not None or key in self._depth_query_cache:
-            return cached
+        rows, cols = self.depth_grid.shape
+        fy = ((self.depth_grid_north - lat) /
+              (self.depth_grid_north - self.depth_grid_south)) * (rows - 1)
+        fx = ((lon - self.depth_grid_west) /
+              (self.depth_grid_east - self.depth_grid_west)) * (cols - 1)
 
-        zone, exact_contour = self._zone_at_model_pixel(mx, my)
-        if zone is None or zone < 0:
-            result = None
-        else:
-            lower, upper = self._depth_zone_bounds(zone)
-            interpolated = False
+        # Do not smear a water value onto adjacent land when interpolating at
+        # the shoreline. The nearest 1 m cell must itself contain water.
+        nearest_x = max(0, min(cols - 1, int(round(fx))))
+        nearest_y = max(0, min(rows - 1, int(round(fy))))
+        if not np.isfinite(self.depth_grid[nearest_y, nearest_x]):
+            return None
 
-            if exact_contour is not None:
-                depth_m = exact_contour
-                lower = upper = exact_contour
-            elif (zone == 1 and
-                  self._depth_zone1_to_shallow is not None and
-                  self._depth_zone1_to_deep is not None):
-                # Position within the contour band: 0 at the shallower side,
-                # 1 at the deeper side. This is what creates localized blue ->
-                # yellow -> red transitions instead of coloring a whole leg.
-                d_shallow = float(self._depth_zone1_to_shallow[my, mx])
-                d_deep = float(self._depth_zone1_to_deep[my, mx])
-                denom = d_shallow + d_deep
-                fraction = d_shallow / denom if denom > 1e-6 else 0.5
-                fraction = max(0.0, min(1.0, fraction))
-                depth_m = lower + fraction * (upper - lower)
-                interpolated = True
-            else:
-                # Mid-band is less misleading than pretending we know a slope
-                # where the next contour cannot be reliably recovered.
-                depth_m = (lower + upper) / 2.0
+        x0 = max(0, min(cols - 1, int(math.floor(fx))))
+        y0 = max(0, min(rows - 1, int(math.floor(fy))))
+        x1 = min(cols - 1, x0 + 1)
+        y1 = min(rows - 1, y0 + 1)
+        tx = max(0.0, min(1.0, fx - x0))
+        ty = max(0.0, min(1.0, fy - y0))
 
-            band_width = max(0.0, upper - lower)
-            uncertainty = max(
-                self.depth_uncertainty_m,
-                0.35 * band_width if band_width > 0.0 else 0.0)
-            if zone >= len(self.depth_contours_m):
-                # Beyond the deepest labelled line, the model extrapolates one
-                # contour interval at a time and should be treated more loosely.
-                uncertainty += 0.5
+        samples = (
+            (self.depth_grid[y0, x0], (1.0 - tx) * (1.0 - ty)),
+            (self.depth_grid[y0, x1], tx * (1.0 - ty)),
+            (self.depth_grid[y1, x0], (1.0 - tx) * ty),
+            (self.depth_grid[y1, x1], tx * ty),
+        )
+        weighted = 0.0
+        total_weight = 0.0
+        for value, weight in samples:
+            if np.isfinite(value) and weight > 0.0:
+                weighted += float(value) * weight
+                total_weight += weight
 
-            result = {
-                "depth_m": float(max(0.0, depth_m)),
-                "uncertainty_m": float(uncertainty),
-                "contour_count": int(zone),
-                "zone_lower_m": float(lower),
-                "zone_upper_m": float(upper),
-                "interpolated": bool(interpolated),
-                "on_contour": exact_contour is not None,
-            }
+        if total_weight <= 1e-9:
+            return None
 
-        self._depth_query_cache[key] = result
-        excess = len(self._depth_query_cache) - self._depth_query_cache_limit
-        if excess > 0:
-            for old_key in list(self._depth_query_cache.keys())[:excess]:
-                self._depth_query_cache.pop(old_key, None)
-        return result
+        depth_m = max(0.0, weighted / total_weight)
+        return {
+            "depth_m": float(depth_m),
+            "uncertainty_m": float(self.depth_uncertainty_m),
+            "grid_spacing_m": self.depth_grid_spacing_m,
+        }
 
     @property
     def center(self):
@@ -1547,11 +1323,11 @@ class MapViewMixin:
 
             estimate = self.mapview.depth_estimate_at(lat, lon)
             if estimate is None:
-                reason = getattr(layer, "_depth_model_error", None)
+                reason = getattr(layer, "_depth_grid_error", None)
                 if reason:
                     detail = f" ({reason})"
                 else:
-                    detail = " (outside mapped water or contour geometry ambiguous)"
+                    detail = " (outside the static depth grid or over land/unmapped water)"
                 self.append_log(
                     f"** Approx. depth unavailable at {lat:.5f}, {lon:.5f}{detail}. **")
                 return
@@ -1636,7 +1412,7 @@ class MapViewMixin:
                                   "depth_layer", None)
             if depth_layer is not None:
                 parts.append(
-                    "Depth: NS Fisheries Lake Inventory - Bathymetry may not be accurate")
+                    "Depth: static PDF-derived grid - approximate only")
 
             label.configure(text="   |   ".join(parts))
 
@@ -1665,16 +1441,18 @@ class MapViewMixin:
                 if self.wp_map_layer is not None:
                     self.wp_map_layer.refresh(structural=True)
                 self._update_map_attribution()
-                if layer._depth_model_ready:
-                    contours = ", ".join(
-                        f"{v:g}" for v in layer.depth_contours_m)
+                if layer._depth_grid_ready:
+                    spacing = layer.depth_grid_spacing_m
+                    spacing_note = (
+                        f"{spacing:g} m grid" if spacing is not None
+                        else "static grid")
                     depth_note = (
-                        f"Numeric interpolation enabled from {contours} m contours; "
+                        f"Numeric depth loaded from {spacing_note}; "
                         f"nominal uncertainty ±{layer.depth_uncertainty_m:.2g} m.")
                 else:
                     depth_note = (
-                        "Numeric interpolation unavailable: "
-                        f"{layer._depth_model_error or 'unknown estimator error'}." )
+                        "Numeric depth unavailable: "
+                        f"{layer._depth_grid_error or 'unknown grid error'}." )
                 self.append_log(
                     f"** Lake depth enabled: {layer.name}. {depth_note} "
                     "Bathymetry may not be accurate. **")
