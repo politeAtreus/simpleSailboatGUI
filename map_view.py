@@ -80,16 +80,33 @@ NS_LAKE_DEPTH_ATTRIBUTION = (
 # removed or replaced by the corrected metadata.
 LAKE_DEPTH_BOUND_OVERRIDES = {
     "lake micmac": {
+        # Bounds after the first-point translation correction.
         "north": 44.6997751,
         "south": 44.6845151,
         "west": -63.5621433,
         "east": -63.5467633,
+        # Similarity transform solved from the second control point.
+        # Positive rotation is counter-clockwise on the map.
+        "transform": {
+            "anchor_lat": 44.6940442,
+            "anchor_lon": -63.5602020,
+            "scale": 1.0483028,
+            "rotation_deg": -3.3474663,
+        },
     },
     "lake charles": {
+        # Bounds after the first-point translation correction.
         "north": 44.7373715,
         "south": 44.7084315,
         "west": -63.5563978,
         "east": -63.5450578,
+        # Similarity transform solved from the second control point.
+        "transform": {
+            "anchor_lat": 44.7158269,
+            "anchor_lon": -63.5537399,
+            "scale": 1.0762620,
+            "rotation_deg": 3.1613348,
+        },
     },
 }
 
@@ -136,32 +153,35 @@ def _webmercator_x(lon):
     return (float(lon) + 180.0) / 360.0
 
 
+def _webmercator_lon(x):
+    """Convert normalized Web-Mercator X back to longitude."""
+    return float(x) * 360.0 - 180.0
+
+
+def _webmercator_lat(y):
+    """Convert normalized Web-Mercator Y back to latitude."""
+    n = math.pi * (1.0 - 2.0 * float(y))
+    return math.degrees(math.atan(math.sinh(n)))
+
+
 class LakeDepthRaster:
-    """One local, north-up bathymetry raster georeferenced by lat/lon bounds.
+    """Local bathymetry raster with translation, scale and rotation correction.
 
-    Package layout::
+    The original Nova Scotia inventory map is first georeferenced by a simple
+    north/south/east/west bounding box.  A per-lake similarity transform may
+    then be applied around a known-good geographic anchor::
 
-        lake_depth_maps/
-          Lake_Banook/
-            metadata.json
-            overlay.png
-
-    metadata.json example::
-
-        {
-          "name": "Lake Banook",
-          "image": "overlay.png",
-          "bounds": {
-            "north": 44.6900, "south": 44.6700,
-            "west": -63.5650, "east": -63.5450
-          },
-          "preferred_zoom": 15,
-          "source_url": "https://novascotia.ca/...pdf"
+        transform = {
+            "anchor_lat": 44.6940442,
+            "anchor_lon": -63.5602020,
+            "scale": 1.0483,
+            "rotation_deg": -3.3475,
         }
 
-    The PNG should already be north-up and transparent outside the useful
-    depth-map drawing. Rendering is done directly into XYZ tiles, so pan/zoom
-    performance remains comparable to the base-map cache.
+    This is much more accurate than trying to represent a rotated scan using
+    only axis-aligned bounds.  The transform is performed in Web-Mercator
+    space, the same projection used by the XYZ base-map tiles, so the contours
+    stay aligned while panning and zooming.
     """
 
     _TILE_CACHE_LIMIT = 600
@@ -180,10 +200,19 @@ class LakeDepthRaster:
         if not os.path.isfile(self.image_path):
             raise FileNotFoundError(self.image_path)
 
-        bounds = meta.get("bounds") or {}
+        bounds = dict(meta.get("bounds") or {})
+        transform = dict(meta.get("transform") or {})
+
+        # Code-side overrides make it possible to calibrate the supplied lake
+        # packages without requiring every existing metadata.json to be edited.
         override = LAKE_DEPTH_BOUND_OVERRIDES.get(self.name.strip().lower())
         if override:
-            bounds = override
+            for k in ("north", "south", "west", "east"):
+                if k in override:
+                    bounds[k] = override[k]
+            if override.get("transform"):
+                transform.update(override["transform"])
+
         self.north = float(bounds["north"])
         self.south = float(bounds["south"])
         self.west = float(bounds["west"])
@@ -198,13 +227,22 @@ class LakeDepthRaster:
             meta.get("opacity", LAKE_DEPTH_DEFAULT_OPACITY))
         self.default_opacity = max(0.05, min(1.0, self.default_opacity))
 
-        # A stable identity for the composite RAM cache. If the overlay file or
-        # metadata is replaced, mtime/size changes and a fresh key is used.
-        stat_img = os.stat(self.image_path)
-        stat_meta = os.stat(self.metadata_path)
-        self.cache_id = (
-            self.name, self.image_path, stat_img.st_mtime_ns, stat_img.st_size,
-            stat_meta.st_mtime_ns, stat_meta.st_size)
+        # Similarity transform.  rotation_deg uses ordinary map orientation:
+        # positive = counter-clockwise, negative = clockwise.
+        self.transform_scale = float(transform.get("scale", 1.0))
+        if self.transform_scale <= 0:
+            raise ValueError("lake-depth transform scale must be > 0")
+        self.rotation_deg = float(transform.get("rotation_deg", 0.0))
+        self.rotation_rad = math.radians(self.rotation_deg)
+        self._rot_c = math.cos(self.rotation_rad)
+        self._rot_s = math.sin(self.rotation_rad)
+
+        default_anchor_lat = (self.north + self.south) / 2.0
+        default_anchor_lon = (self.west + self.east) / 2.0
+        self.anchor_lat = float(transform.get("anchor_lat", default_anchor_lat))
+        self.anchor_lon = float(transform.get("anchor_lon", default_anchor_lon))
+        self._anchor_wx = _webmercator_x(self.anchor_lon)
+        self._anchor_wy = _webmercator_y(self.anchor_lat)
 
         with Image.open(self.image_path) as img:
             img.load()
@@ -213,20 +251,79 @@ class LakeDepthRaster:
         self._tile_cache = {}
         self._tile_cache_lock = threading.Lock()
 
-        # Store bounds in normalized Web-Mercator coordinates because that is
-        # the projection used by XYZ tiles.
+        # Axis-aligned *pre-transform* raster bounds in Web-Mercator.
         self._wx0 = _webmercator_x(self.west)
         self._wx1 = _webmercator_x(self.east)
         self._wy0 = _webmercator_y(self.north)
         self._wy1 = _webmercator_y(self.south)
+        self._layer_wx = self._wx1 - self._wx0
+        self._layer_wy = self._wy1 - self._wy0
+
+        # A stable identity for the composite RAM cache.  Transform values are
+        # included so changing calibration immediately creates a fresh variant.
+        stat_img = os.stat(self.image_path)
+        stat_meta = os.stat(self.metadata_path)
+        self.cache_id = (
+            self.name, self.image_path, stat_img.st_mtime_ns, stat_img.st_size,
+            stat_meta.st_mtime_ns, stat_meta.st_size,
+            round(self.anchor_lat, 8), round(self.anchor_lon, 8),
+            round(self.transform_scale, 8), round(self.rotation_deg, 8),
+            round(self.north, 8), round(self.south, 8),
+            round(self.west, 8), round(self.east, 8))
+
+    # ------------------------------------------------------------------ #
+    # Similarity transform helpers
+    # ------------------------------------------------------------------ #
+
+    def _forward_transform(self, wx, wy):
+        """Map pre-transform Web-Mercator coordinate to calibrated position."""
+        # Use north-positive local coordinates for intuitive rotation signs.
+        dx = wx - self._anchor_wx
+        dy_north = self._anchor_wy - wy
+
+        x2 = self.transform_scale * (
+            self._rot_c * dx - self._rot_s * dy_north)
+        y2_north = self.transform_scale * (
+            self._rot_s * dx + self._rot_c * dy_north)
+
+        return (self._anchor_wx + x2,
+                self._anchor_wy - y2_north)
+
+    def _inverse_transform(self, wx, wy):
+        """Map calibrated Web-Mercator coordinate back into source-raster space."""
+        dx2 = wx - self._anchor_wx
+        dy2_north = self._anchor_wy - wy
+        inv = 1.0 / self.transform_scale
+
+        # R(-theta) / scale.
+        dx = inv * (self._rot_c * dx2 + self._rot_s * dy2_north)
+        dy_north = inv * (-self._rot_s * dx2 + self._rot_c * dy2_north)
+
+        return (self._anchor_wx + dx,
+                self._anchor_wy - dy_north)
+
+    def _source_pixel_for_tile_pixel(self, px, py, tx0, ty0,
+                                     tile_span, tile_size):
+        """Return source-image pixel corresponding to one output tile pixel."""
+        wx_out = tx0 + (float(px) / tile_size) * tile_span
+        wy_out = ty0 + (float(py) / tile_size) * tile_span
+        wx_src, wy_src = self._inverse_transform(wx_out, wy_out)
+
+        src_w, src_h = self.image.size
+        sx = (wx_src - self._wx0) / self._layer_wx * src_w
+        sy = (wy_src - self._wy0) / self._layer_wy * src_h
+        return sx, sy
 
     @property
     def center(self):
-        return ((self.north + self.south) / 2.0,
-                (self.west + self.east) / 2.0)
+        """Geographic centre after the calibration transform is applied."""
+        wx = (self._wx0 + self._wx1) / 2.0
+        wy = (self._wy0 + self._wy1) / 2.0
+        wx, wy = self._forward_transform(wx, wy)
+        return (_webmercator_lat(wy), _webmercator_lon(wx))
 
     def render_tile(self, zoom, x, y, tile_size, opacity=1.0):
-        """Render this raster into one transparent XYZ tile, or return None."""
+        """Render the calibrated raster into one transparent XYZ tile."""
         from PIL import Image
 
         opacity = max(0.0, min(1.0, float(opacity)))
@@ -240,61 +337,70 @@ class LakeDepthRaster:
                 return cached.copy()
 
         n = float(2 ** int(zoom))
-        tx0, tx1 = x / n, (x + 1) / n
-        ty0, ty1 = y / n, (y + 1) / n
+        tile_span = 1.0 / n
+        tx0 = x * tile_span
+        ty0 = y * tile_span
 
-        ix0 = max(tx0, self._wx0)
-        ix1 = min(tx1, self._wx1)
-        iy0 = max(ty0, self._wy0)
-        iy1 = min(ty1, self._wy1)
-        if ix1 <= ix0 or iy1 <= iy0:
-            return None
+        # PIL's affine transform needs output->input mapping.  The whole
+        # georeferencing + rotation + scale chain is affine in Web-Mercator, so
+        # three sample points give exact coefficients for this tile.
+        p00 = self._source_pixel_for_tile_pixel(
+            0.0, 0.0, tx0, ty0, tile_span, tile_size)
+        p10 = self._source_pixel_for_tile_pixel(
+            1.0, 0.0, tx0, ty0, tile_span, tile_size)
+        p01 = self._source_pixel_for_tile_pixel(
+            0.0, 1.0, tx0, ty0, tile_span, tile_size)
 
+        a = p10[0] - p00[0]
+        b = p01[0] - p00[0]
+        c = p00[0]
+        d = p10[1] - p00[1]
+        e = p01[1] - p00[1]
+        f = p00[1]
+
+        # Fast reject: map the output tile corners to source coordinates and
+        # skip tiles whose inverse-projected footprint cannot touch the image.
         src_w, src_h = self.image.size
-        layer_wx = self._wx1 - self._wx0
-        layer_wy = self._wy1 - self._wy0
-
-        sx0 = (ix0 - self._wx0) / layer_wx * src_w
-        sx1 = (ix1 - self._wx0) / layer_wx * src_w
-        sy0 = (iy0 - self._wy0) / layer_wy * src_h
-        sy1 = (iy1 - self._wy0) / layer_wy * src_h
-
-        dx0 = int(round((ix0 - tx0) / (tx1 - tx0) * tile_size))
-        dx1 = int(round((ix1 - tx0) / (tx1 - tx0) * tile_size))
-        dy0 = int(round((iy0 - ty0) / (ty1 - ty0) * tile_size))
-        dy1 = int(round((iy1 - ty0) / (ty1 - ty0) * tile_size))
-
-        dx0 = max(0, min(tile_size, dx0))
-        dx1 = max(0, min(tile_size, dx1))
-        dy0 = max(0, min(tile_size, dy0))
-        dy1 = max(0, min(tile_size, dy1))
-        if dx1 <= dx0 or dy1 <= dy0:
+        corners = [
+            self._source_pixel_for_tile_pixel(
+                0, 0, tx0, ty0, tile_span, tile_size),
+            self._source_pixel_for_tile_pixel(
+                tile_size, 0, tx0, ty0, tile_span, tile_size),
+            self._source_pixel_for_tile_pixel(
+                0, tile_size, tx0, ty0, tile_span, tile_size),
+            self._source_pixel_for_tile_pixel(
+                tile_size, tile_size, tx0, ty0, tile_span, tile_size),
+        ]
+        min_sx = min(v[0] for v in corners)
+        max_sx = max(v[0] for v in corners)
+        min_sy = min(v[1] for v in corners)
+        max_sy = max(v[1] for v in corners)
+        if max_sx < 0 or min_sx > src_w or max_sy < 0 or min_sy > src_h:
             return None
 
-        # Slight overlap at source crop edges prevents one-pixel seams from
-        # rounding when adjacent XYZ tiles are rendered independently.
-        crop = self.image.crop((
-            max(0, int(math.floor(sx0)) - 1),
-            max(0, int(math.floor(sy0)) - 1),
-            min(src_w, int(math.ceil(sx1)) + 1),
-            min(src_h, int(math.ceil(sy1)) + 1),
-        ))
-        if crop.width <= 0 or crop.height <= 0:
-            return None
-
-        if hasattr(Image, "Resampling"):
-            resample = Image.Resampling.LANCZOS
+        if hasattr(Image, "Transform"):
+            affine_mode = Image.Transform.AFFINE
         else:
-            resample = Image.LANCZOS
-        crop = crop.resize((dx1 - dx0, dy1 - dy0), resample)
+            affine_mode = Image.AFFINE
+        if hasattr(Image, "Resampling"):
+            resample = Image.Resampling.BICUBIC
+        else:
+            resample = Image.BICUBIC
+
+        tile = self.image.transform(
+            (tile_size, tile_size),
+            affine_mode,
+            (a, b, c, d, e, f),
+            resample=resample,
+            fillcolor=(0, 0, 0, 0))
 
         if opacity < 0.999:
-            alpha = crop.getchannel("A").point(
-                lambda a: int(a * opacity))
-            crop.putalpha(alpha)
+            alpha = tile.getchannel("A").point(lambda av: int(av * opacity))
+            tile.putalpha(alpha)
 
-        tile = Image.new("RGBA", (tile_size, tile_size), (0, 0, 0, 0))
-        tile.alpha_composite(crop, (dx0, dy0))
+        # Do not keep completely transparent tiles in memory.
+        if tile.getbbox() is None:
+            return None
 
         with self._tile_cache_lock:
             self._tile_cache[key] = tile.copy()

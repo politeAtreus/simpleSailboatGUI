@@ -2,10 +2,10 @@
   "name": "Lake Charles",
   "image": "overlay.png",
   "bounds": {
-    "north": 44.73728,
-    "south": 44.70834,
-    "west": -63.5554,
-    "east": -63.54406
+    "north": 44.7373715,
+    "south": 44.7084315,
+    "west": -63.5563978,
+    "east": -63.5450578
   },
   "preferred_zoom": 15,
   "opacity": 0.8,
@@ -37,6 +37,19 @@
       "reason": "Visual alignment correction against current OSM shoreline in the GUI.",
       "shift": "slightly west and north",
       "scale": "width increased slightly"
+    },
+    "two_point_similarity_transform_2026_08_20": {
+      "description": "Second control point used to solve uniform scale and rotation around the first corrected anchor.",
+      "anchor_lat": 44.7158269,
+      "anchor_lon": -63.5537399,
+      "scale": 1.076262,
+      "rotation_deg": 3.1613348
     }
+  },
+  "transform": {
+    "anchor_lat": 44.7158269,
+    "anchor_lon": -63.5537399,
+    "scale": 1.076262,
+    "rotation_deg": 3.1613348
   }
 }
