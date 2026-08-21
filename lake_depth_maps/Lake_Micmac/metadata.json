@@ -1,0 +1,55 @@
+{
+  "name": "Lake Micmac",
+  "image": "overlay.png",
+  "bounds": {
+    "north": 44.6997751,
+    "south": 44.6845151,
+    "west": -63.5621433,
+    "east": -63.5467633
+  },
+  "preferred_zoom": 16,
+  "opacity": 0.8,
+  "source": "Nova Scotia Fisheries & Aquaculture Lake Inventory",
+  "source_url": "https://novascotia.ca/fish/documents/lake-inventory-maps/3-H-micmac.pdf",
+  "notes": "Bathymetry may not be accurate.",
+  "calibration": {
+    "method": "North-up scan; scale from printed 500 m scale bar; anchored to HRM primary outlet coordinate.",
+    "render_dpi": 300,
+    "crop_pixels": {
+      "left": 520,
+      "top": 520,
+      "right": 1740,
+      "bottom": 2225
+    },
+    "anchor_pixel_full_page": {
+      "x": 1660,
+      "y": 2165
+    },
+    "anchor_primary_outlet": {
+      "lat": 44.68416666666666,
+      "lon": -63.55027777777777
+    },
+    "printed_scale_bar_pixels_for_500m": 496.0,
+    "approx_max_depth_m": 7.1,
+    "calibration_source_url": "https://cdn.halifax.ca/sites/default/files/documents/city-hall/standing-committees/251204essc1312.pdf",
+    "warning": "Bathymetry may not be accurate.",
+    "manual_adjustment_2026_08_20": {
+      "reason": "Visual alignment correction against current OSM shoreline in the GUI.",
+      "shift": "slightly east and north",
+      "scale": "slightly reduced"
+    },
+    "two_point_similarity_transform_2026_08_20": {
+      "description": "Second control point used to solve uniform scale and rotation around the first corrected anchor.",
+      "anchor_lat": 44.6940442,
+      "anchor_lon": -63.560202,
+      "scale": 1.0483028,
+      "rotation_deg": -3.3474663
+    }
+  },
+  "transform": {
+    "anchor_lat": 44.6940442,
+    "anchor_lon": -63.560202,
+    "scale": 1.0483028,
+    "rotation_deg": -3.3474663
+  }
+}

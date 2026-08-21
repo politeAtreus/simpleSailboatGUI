@@ -1,0 +1,55 @@
+{
+  "name": "Lake Charles",
+  "image": "overlay.png",
+  "bounds": {
+    "north": 44.7373715,
+    "south": 44.7084315,
+    "west": -63.5563978,
+    "east": -63.5450578
+  },
+  "preferred_zoom": 15,
+  "opacity": 0.8,
+  "source": "Nova Scotia Fisheries & Aquaculture Lake Inventory",
+  "source_url": "https://novascotia.ca/fish/documents/lake-inventory-maps/3-H-charles.pdf",
+  "notes": "Bathymetry may not be accurate.",
+  "calibration": {
+    "method": "North-up scan; scale from printed 500 m scale bar; anchored to HRM primary outlet coordinate.",
+    "render_dpi": 300,
+    "crop_pixels": {
+      "left": 1380,
+      "top": 320,
+      "right": 2110,
+      "bottom": 2940
+    },
+    "anchor_pixel_full_page": {
+      "x": 1455,
+      "y": 2900
+    },
+    "anchor_primary_outlet": {
+      "lat": 44.70861111111111,
+      "lon": -63.553888888888885
+    },
+    "printed_scale_bar_pixels_for_500m": 407.0,
+    "approx_max_depth_m": 25.7,
+    "calibration_source_url": "https://cdn.halifax.ca/sites/default/files/documents/city-hall/standing-committees/251204essc1312.pdf",
+    "warning": "Bathymetry may not be accurate.",
+    "manual_adjustment_2026_08_20": {
+      "reason": "Visual alignment correction against current OSM shoreline in the GUI.",
+      "shift": "slightly west and north",
+      "scale": "width increased slightly"
+    },
+    "two_point_similarity_transform_2026_08_20": {
+      "description": "Second control point used to solve uniform scale and rotation around the first corrected anchor.",
+      "anchor_lat": 44.7158269,
+      "anchor_lon": -63.5537399,
+      "scale": 1.076262,
+      "rotation_deg": 3.1613348
+    }
+  },
+  "transform": {
+    "anchor_lat": 44.7158269,
+    "anchor_lon": -63.5537399,
+    "scale": 1.076262,
+    "rotation_deg": 3.1613348
+  }
+}
